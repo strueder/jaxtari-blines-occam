@@ -1,0 +1,67 @@
+# =====================================================================
+#  OCCAM baseline config  (neuro-symbolic, object-centric masking)
+#  Run with:   python main.py --config-name occam
+#  -> place this file at   config/occam.yaml
+#
+#  Deliberately FULLY self-contained (flat, all keys UPPERCASE): main.py
+#  does merged_config = {**config, **config.get("alg", {})}, i.e. a flat
+#  config without an 'alg:' block is used as-is. This way the run works
+#  without a separate alg/ppo.yaml.
+# =====================================================================
+
+# ----- experiment -----
+NAME_INITIALS: "RE"
+NUM_SEEDS: 1
+SEED: 0
+ALG: "PPO"
+EXP_NAME: "occam_binary"      # shows up in the wandb run name
+
+# ----- wandb -----
+WANDB_MODE: "online"          # "online" | "offline" | "disabled"
+ENTITY: ""                    # your wandb entity (empty = default)
+PROJECT: "occam-jaxtari"      # your wandb project
+
+# ----- saving / HF -----
+SAVE_PATH: "./models"
+UPLOAD_MODEL: False
+HF_ENTITY: ""
+
+# ----- environment -----
+ENV_ID: pong                  # tested: pong, breakout, freeway, seaquest, ... (TIER 1/2)
+TRAIN_MODS: []
+EVAL_MODS: ["lazy_enemy"]     # pong-specific; adjust/empty for other games
+EVAL_DURING_TRAIN: True
+EVAL_EVERY: 50                # in ALG iterations; metrics are computed at every eval
+VIDEO_EVERY: 1000            # in ALG iterations; a comparison video is rendered only
+                             # this often (must be a multiple of EVAL_EVERY)
+CAPTURE_VIDEO: True          # produces the [game | mask] comparison video (see occam.py)
+
+# ----- OCCAM (object-centric masking) -----
+OCCAM: True                   # enables the OCCAMWrapper instead of PixelObsWrapper
+MASK_MODE: "binary"           # "object" | "binary" | "class" | "planes"
+OCCAM_FRAME_STACK: 4          # >= 2 (otherwise obs.squeeze() collapses the channel axis)
+OCCAM_FRAME_SKIP: 4           # identical to the pixel baseline -> fair comparability
+OCCAM_MAX_POOLING: True       # identical to the pixel baseline (anti-flicker)
+
+# OCCAM is image-based -> it uses the CNN (Network), not the MLP.
+# PIXEL_BASED stays False; the network/wrapper selection accounts for OCCAM
+# separately (see the integration patch in the guide).
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True      # irrelevant for OCCAM (we render natively + resize ourselves)
+
+# ----- PPO hyperparameters (CleanRL Atari-PPO; cf. OCCAM paper Tab. 3) -----
+LEARNING_RATE: 2.5e-4
+NUM_ENVS: 32                  # smoke-test friendly; for 'planes' on high-class
+                              # games (e.g. beamrider, K=12) lower to 16 if needed
+NUM_STEPS: 128
+TOTAL_TIMESTEPS: 1000000      # smoke test (~244 iter). For a real comparison: 10_000_000
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+NUM_MINIBATCHES: 4
+UPDATE_EPOCHS: 4
+CLIP_COEF: 0.1
+ENT_COEF: 0.01
+VF_COEF: 0.5
+MAX_GRAD_NORM: 0.5
+ANNEAL_LR: True
+NORM_ADV: True

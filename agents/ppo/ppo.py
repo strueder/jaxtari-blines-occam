@@ -18,10 +18,13 @@ import jaxatari
 from jaxatari.wrappers import NormalizeObservationWrapper, ObjectCentricWrapper, PixelObsWrapper, AtariWrapper, LogWrapper, FlattenObservationWrapper
 from jaxatari import spaces
 from agents.ppo.ppo_eval import evaluate
+from agents.occam.occam import OCCAMWrapper, log_occam_comparison_video
 
 from rtpt import RTPT
 
-def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
+def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False,
+             occam=False, mask_mode="binary", occam_frame_stack=4,
+             occam_frame_skip=4, occam_max_pooling=True):
     def thunk():
         # For training (eval=False), avoid applying multiple potentially conflicting
         # mods at once. In that case, fall back to the base environment.
@@ -46,28 +49,27 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                 noop_max=30,
                 full_action_space=False,
         )
-        if pixel_based:
-            env = PixelObsWrapper(
+        if occam:
+            env = OCCAMWrapper(
                 env,
-                do_pixel_resize=True,
-                pixel_resize_shape=(84, 84),
-                grayscale=True,
-                use_native_downscaling=native_downscaling,
-                smooth_image=False,
-                frame_stack_size=4,
-                frame_skip=4,
-                max_pooling=True,
-                clip_reward=True, # only active during training
+                mask_mode=mask_mode,
+                frame_stack_size=occam_frame_stack,
+                frame_skip=occam_frame_skip,
+                max_pooling=occam_max_pooling,
+                clip_reward=True,         # only active during training (eval=False)
+                game_name=env_id,
+            )
+        elif pixel_based:
+            env = PixelObsWrapper(
+                env, do_pixel_resize=True, pixel_resize_shape=(84, 84),
+                grayscale=True, use_native_downscaling=native_downscaling,
+                smooth_image=False, frame_stack_size=4, frame_skip=4,
+                max_pooling=True, clip_reward=True,
             )
         else:
             env = FlattenObservationWrapper(
                 NormalizeObservationWrapper(
-                    ObjectCentricWrapper(
-                        env,
-                        frame_stack_size=4,
-                        frame_skip=4,
-                        clip_reward=True,
-                    )
+                    ObjectCentricWrapper(env, frame_stack_size=4, frame_skip=4, clip_reward=True)
                 )
             )
         env = LogWrapper(env)
@@ -201,7 +203,15 @@ def single_run(config: dict):
     key, obs_sample_key1, obs_sample_key2, obs_sample_key3 = jax.random.split(key, 4)
 
     # env setup
-    env = make_env(config["ENV_ID"], list(config["TRAIN_MODS"]), config["PIXEL_BASED"], config["NATIVE_DOWNSCALING"], False)()
+    env = make_env(
+        config["ENV_ID"], list(config["TRAIN_MODS"]),
+        config["PIXEL_BASED"], config["NATIVE_DOWNSCALING"], False,
+        occam=config.get("OCCAM", False),
+        mask_mode=config.get("MASK_MODE", "binary"),
+        occam_frame_stack=config.get("OCCAM_FRAME_STACK", 4),
+        occam_frame_skip=config.get("OCCAM_FRAME_SKIP", 4),
+        occam_max_pooling=config.get("OCCAM_MAX_POOLING", True),
+    )()
    
     # vmap and squeeze observations in order to get (B, F, H, W, 1) -> (B, F, H, W),
     # where F is the frame stack which becomes the channel for the convolutions
@@ -228,7 +238,7 @@ def single_run(config: dict):
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_ITERATIONS"]
         return config["LEARNING_RATE"] * frac
 
-    network = Network() if config["PIXEL_BASED"] else MLP_Network()
+    network = Network() if (config["PIXEL_BASED"] or config.get("OCCAM", False)) else MLP_Network()
     actor = Actor(action_dim=env.action_space().n)
     critic = Critic()
     # network_params = network.init(network_key, env.observation_space().sample(obs_sample_key1).squeeze()[None, ...])
@@ -429,30 +439,38 @@ def single_run(config: dict):
                     pixel_based=config["PIXEL_BASED"],
                     native_downscaling=config["NATIVE_DOWNSCALING"],
                     eval=True,
+                    occam=config.get("OCCAM", False),
+                    mask_mode=config.get("MASK_MODE", "binary"),
+                    occam_frame_stack=config.get("OCCAM_FRAME_STACK", 4),
+                    occam_frame_skip=config.get("OCCAM_FRAME_SKIP", 4),
+                    occam_max_pooling=config.get("OCCAM_MAX_POOLING", True),
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,
-                Model=(Network, Actor, Critic) if config["PIXEL_BASED"] else (MLP_Network, Actor, Critic),
+                Model=(Network, Actor, Critic) if (config["PIXEL_BASED"] or config.get("OCCAM", False)) else (MLP_Network, Actor, Critic),
                 seed=config["SEED"],
             )
             # wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns)), "step": iteration})
             metrics[mod_label] = np.mean(jax.device_get(episodic_returns))
             wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns))}, step=iteration)
 
-            if config["CAPTURE_VIDEO"]: 
-                # Instantiate a clean renderer immune to the training env's downscaling
-                clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_config).renderer
-                frames = jax.vmap(clean_renderer.render)(env_states)
-                # shape: (N, H, W, C) -> (N, C, H, W)
-                frames = jnp.transpose(frames, (0, 3, 1, 2))
-                video = wandb.Video(np.array(frames), fps=30, format="mp4")
-                wandb.log(
-                    {
-                        f"eval/video_{mod_label}": video,
-                    },
-                    step=iteration,
-                )
-                print(f"Video (eval) logged to wandb with {frames.shape[0]} frames.")
+            want_video = config["CAPTURE_VIDEO"] and (
+                iteration % config.get("VIDEO_EVERY", 100) == 0
+                or iteration >= config["NUM_ITERATIONS"] - config["EVAL_EVERY"]  # immer den letzten Step
+            )
+            if want_video:
+                if config.get("OCCAM", False):
+                    log_occam_comparison_video(
+                        config["ENV_ID"], config["MASK_MODE"], env_states,
+                        mods=mods_config, mod_label=mod_label, step=iteration, fps=30,
+                        save_dir=config["SAVE_PATH"],   # <- dumpt eval_<mod>.npy für den Zusammenschnitt
+                    )
+                    print(f"OCCAM video [{config['ENV_ID']}/{config['MASK_MODE']}/{mod_label}] logged.")
+                else:
+                    clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_config).renderer
+                    frames = jnp.transpose(jax.vmap(clean_renderer.render)(env_states), (0, 3, 1, 2))
+                    wandb.log({f"eval/{config['ENV_ID']}/pixel/{mod_label}":
+                               wandb.Video(np.array(frames), fps=30, format="mp4")}, step=iteration)
         return metrics
 
     # TRY NOT TO MODIFY: start the game
