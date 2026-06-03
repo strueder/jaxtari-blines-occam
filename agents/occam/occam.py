@@ -530,9 +530,11 @@ def _load_font(size: int):
         return None
 
 
-def _text_banner(width: int, text: str, height: int, font_size: int = 16) -> np.ndarray:
-    """A black (height, width, 3) banner with centered-left white text, readable font."""
-    banner = np.zeros((height, width, 3), np.uint8)
+def _text_banner(width: int, text: str, height: int, font_size: int = 16,
+                 bg=(255, 255, 255), fg=(0, 0, 0)) -> np.ndarray:
+    """A (height, width, 3) banner filled with `bg`, left-aligned `text` in `fg`."""
+    banner = np.full((height, width, 3), 0, np.uint8)
+    banner[:] = np.array(bg, np.uint8)
     try:
         from PIL import Image, ImageDraw
         im = Image.fromarray(banner)
@@ -544,7 +546,7 @@ def _text_banner(width: int, text: str, height: int, font_size: int = 16) -> np.
             ty = max(0, (height - (bbox[3] - bbox[1])) // 2 - bbox[1])
         except Exception:
             ty = max(0, (height - font_size) // 2)
-        d.text((6, ty), text, fill=(255, 255, 255), font=font)
+        d.text((6, ty), text, fill=tuple(fg), font=font)
         banner = np.asarray(im)
     except Exception:
         pass
@@ -664,7 +666,7 @@ def build_occam_summary_video(
     log_wandb: bool = False,
     max_frames: int | None = None,
     strip_top_px: int = 0,
-    hold_last_seconds: float = 2.0,
+    hold_last_seconds: float = 4.0,
     wandb_project: str | None = None,
     wandb_entity: str | None = None,
     wandb_tags=None,
@@ -749,24 +751,43 @@ def build_occam_summary_video(
         out_idx = np.arange(max_len, dtype=np.int64)
     T = len(out_idx)
 
+    BG = (255, 255, 255)   # white background / gaps
+    FG = (0, 0, 0)         # black text
+    bw = 4                 # cell border width (doubled)
+    col_gap = 26           # horizontal gap between the 4 variant cells
+    row_gap = 18           # vertical gap between mod rows
+
     # pre-render the static banners ONCE (text is constant per cell)
-    cap_h, title_h = 22, 30
+    cap_h, title_h = 24, 34
     cell_banner = {
         (mod, mm): _text_banner(
             cell_w,
             f"{(mm or '-').upper()}  -  {mod}" + ("   (n/a)" if clips[(mod, mm)] is None else ""),
-            cap_h, font_size=15,
+            cap_h, font_size=16, bg=BG, fg=FG,
         )
         for mod in mods for mm in grid_order
     }
     eff_h = cell_h - strip_top_px
     black_cell = np.zeros((eff_h, cell_w, 3), np.uint8)
-    title = _text_banner(
-        cell_w * 4,
-        f"{env_id}  -  OCCAM mask comparison    |    columns: object / binary / class / planes"
-        f"    |    rows: {' / '.join(mods)}",
-        title_h, font_size=20,
-    )
+    title = _text_banner(cell_w * 4 + col_gap * 3,
+                         f"{env_id}  -  OCCAM mask comparison", title_h, font_size=24, bg=BG, fg=FG)
+
+    full_cell_h = cap_h + eff_h
+    h_spacer = np.full((full_cell_h, col_gap, 3), 255, np.uint8)        # white gap between cells
+    row_w = cell_w * 4 + col_gap * 3
+    v_spacer = np.full((row_gap, row_w, 3), 255, np.uint8)             # white gap between rows
+
+    def _decorate(frame):
+        """Thick white border around the [game|mask] cell + a divider between halves."""
+        f = np.array(frame, dtype=np.uint8)          # writable copy
+        h, w = f.shape[:2]
+        mid = w // 2
+        f[:, max(0, mid - bw // 2):mid + (bw - bw // 2)] = 255    # game | mask divider (black)
+        f[:bw, :] = 255
+        f[-bw:, :] = 255
+        f[:, :bw] = 255
+        f[:, -bw:] = 255
+        return f
 
     def grid_frame(t_src):
         row_imgs = []
@@ -778,9 +799,22 @@ def build_occam_summary_video(
                     frame = black_cell
                 else:
                     frame = np.asarray(c[min(t_src, c.shape[0] - 1)])[strip_top_px:]   # one frame
-                cells.append(np.concatenate([cell_banner[(mod, mm)], frame], axis=0))
-            row_imgs.append(np.concatenate(cells, axis=1))
-        grid = np.concatenate(row_imgs, axis=0)
+                cell = np.concatenate([cell_banner[(mod, mm)], _decorate(frame)], axis=0)
+                cells.append(cell)
+            # interleave cells with white horizontal spacers
+            row_parts = []
+            for i, cell in enumerate(cells):
+                if i:
+                    row_parts.append(h_spacer)
+                row_parts.append(cell)
+            row_imgs.append(np.concatenate(row_parts, axis=1))
+        # interleave rows with white vertical spacers
+        grid_parts = []
+        for i, ri in enumerate(row_imgs):
+            if i:
+                grid_parts.append(v_spacer)
+            grid_parts.append(ri)
+        grid = np.concatenate(grid_parts, axis=0)
         return np.concatenate([title, grid], axis=0)
 
     # stream the frames straight to the encoder -> peak RAM is ~one output frame.
