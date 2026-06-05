@@ -29,7 +29,7 @@ import time
 from agents.occam.occam import build_occam_summary_video, MASK_MODES
 
 # keys handled by THIS script (not forwarded verbatim to main.py)
-_LAUNCHER_KEYS = {"ENV_ID", "SAVE_ROOT", "VARIANTS", "MASK_MODE", "SAVE_PATH", "EXP_NAME"}
+_LAUNCHER_KEYS = {"ENV_ID", "SAVE_ROOT", "VARIANTS", "MASK_MODE", "SAVE_PATH", "EXP_NAME", "LABEL"}
 
 
 def parse_overrides(argv):
@@ -46,14 +46,16 @@ def main():
     env_id = ov.get("ENV_ID", "pong")
     save_root = ov.get("SAVE_ROOT", "./models")
     variants = [m.strip() for m in ov.get("VARIANTS", ",".join(MASK_MODES)).split(",") if m.strip()]
+    label = ov.get("LABEL", "")
     forwarded = [f"{k}={v}" for k, v in ov.items() if k not in _LAUNCHER_KEYS]
 
     for mm in variants:
+        exp_name = f"occam_{env_id}_{mm}" + (f"_{label}" if label else "")
         save_path = os.path.join(save_root, env_id, mm)
         cmd = [
             "uv", "run", "python", "main.py", "--config-name", "occam",
             f"ENV_ID={env_id}", f"MASK_MODE={mm}",
-            f"SAVE_PATH={save_path}", f"EXP_NAME=occam_{env_id}_{mm}",
+            f"SAVE_PATH={save_path}", f"EXP_NAME={exp_name}",
             *forwarded,
         ]
         print("\n=== training variant:", mm, "===")
