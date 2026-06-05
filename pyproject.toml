@@ -17,10 +17,10 @@ dependencies = [
 [tool.uv]
 override-dependencies = [
     # jax for intel macos
-    "jax==0.4.38; sys_platform == 'darwin' and platform_machine == 'x86_64'",
-    "jaxlib==0.4.38; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # "jax==0.4.38; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # "jaxlib==0.4.38; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     # wandb[media] dependencies for intel macos
-    "rdkit==2025.9.3; sys_platform == 'darwin' and platform_machine == 'x86_64'",
-    "flax==0.10.0; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # "rdkit==2025.9.3; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # "flax==0.10.0; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
