@@ -50,7 +50,7 @@ def main():
     forwarded = [f"{k}={v}" for k, v in ov.items() if k not in _LAUNCHER_KEYS]
 
     for mm in variants:
-        exp_name = f"occam_{env_id}_{mm}"
+        exp_name = f"occam_{env_id}_{mm}" + (f"_{label}" if label else "")
         save_path = os.path.join(save_root, env_id, mm)
         cmd = [
             "uv", "run", "python", "main.py", "--config-name", "occam",

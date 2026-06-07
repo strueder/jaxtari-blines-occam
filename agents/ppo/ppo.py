@@ -192,7 +192,7 @@ def single_run(config: dict):
         entity=config["ENTITY"],
         config=config,
         name=run_name,
-        tags=[_label] if _label else None,
+        tags=[config["LABEL"]] if config.get("LABEL") else None,
         save_code=True,
     )
 
