@@ -50,12 +50,13 @@ def main():
     forwarded = [f"{k}={v}" for k, v in ov.items() if k not in _LAUNCHER_KEYS]
 
     for mm in variants:
-        exp_name = f"occam_{env_id}_{mm}" + (f"_{label}" if label else "")
+        exp_name = f"occam_{env_id}_{mm}"
         save_path = os.path.join(save_root, env_id, mm)
         cmd = [
             "uv", "run", "python", "main.py", "--config-name", "occam",
             f"ENV_ID={env_id}", f"MASK_MODE={mm}",
             f"SAVE_PATH={save_path}", f"EXP_NAME={exp_name}",
+            *([f"LABEL={label}"] if label else []),
             *forwarded,
         ]
         print("\n=== training variant:", mm, "===")
@@ -83,7 +84,7 @@ def main():
     path, nframes = build_occam_summary_video(
         env_id, save_root, mods=None,            # auto-discovers eval mods
         wandb_project=project, wandb_entity=entity,
-        wandb_tags=["summary", env_id, f"steps:{steps}"],
+        wandb_tags=["summary", env_id, f"steps:{steps}"] + ([label] if label else []),
         wandb_run_name=f"summary_{env_id}_{int(time.time())}",
     )
     if path:
