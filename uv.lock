@@ -685,7 +685,7 @@ with-cuda = [
 [[package]]
 name = "jaxatari"
 version = "0.1.0"
-source = { git = "https://github.com/strueder/JAXAtari.git?rev=local%2Fgravitar-integration#7105c35453bf37f45389febe7bf5e0f6abb0758d" }
+source = { git = "https://github.com/strueder/JAXAtari.git?rev=local%2Fgravitar-integration#3027102ee22691089ca4a933b17a0c4022247d54" }
 dependencies = [
     { name = "absl-py" },
     { name = "ale-py" },
