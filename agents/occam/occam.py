@@ -6,7 +6,7 @@ A single-file, JIT-compatible implementation of OCCAM as an observation
 wrapper for JAXtari (https://github.com/k4ntz/JAXAtari), intended as a
 neuro-symbolic baseline for https://github.com/remunds/jaxtari-blines.
 
-Original method (PyTorch / OCAtari / HackAtari):
+Original method:
     "Deep Reinforcement Learning via Object-Centric Attention via Masking (OCCAM)"
     Bl"uml, Derstroff, Gregori, Dillies, Delfosse, Kersting (2025), arXiv:2504.03024
     Reference code: https://github.com/VanillaWhey/OCAtariWrappers
@@ -61,7 +61,6 @@ planes are folded into the channel axis so the existing CNN in jaxtari-blines
 from __future__ import annotations
 
 import functools
-import warnings
 import colorsys
 from typing import Any, List, Tuple
 
@@ -75,32 +74,25 @@ from jaxatari.environment import ObjectObservation
 from jaxatari import spaces
 
 
-# --------------------------------------------------------------------------- #
-#  constants                                                                    #
-# --------------------------------------------------------------------------- #
 MASK_MODES = ("object", "binary", "class", "planes")
 
-# grayscale weights identical to JAXtari's PixelObsWrapper.preprocess_image,
-# so the "object" mask matches the pixel baseline's grayscale exactly.
+# same grayscale weights as PixelObsWrapper for comparability
 _GRAY_W = jnp.array([0.2989, 0.5870, 0.1140], dtype=jnp.float32)
 
 
-# --------------------------------------------------------------------------- #
-#  small pure helpers                                                           #
-# --------------------------------------------------------------------------- #
 def _rgb_to_gray(frame_rgb: jnp.ndarray) -> jnp.ndarray:
     """(H, W, 3) uint8/float -> (H, W) float32 grayscale."""
     return jnp.dot(frame_rgb.astype(jnp.float32), _GRAY_W)
 
 
 def _resize(img: jnp.ndarray, out_hw: Tuple[int, int], method: str) -> jnp.ndarray:
-    """Resize only the last two (spatial) axes of `img` to `out_hw`."""
+    """Resize the last two spatial axes of `img` to `out_hw`."""
     target = tuple(img.shape[:-2]) + tuple(out_hw)
     return jax.image.resize(img.astype(jnp.float32), target, method=method)
 
 
 def _make_gray_palette(n_classes: int) -> np.ndarray:
-    """(n_classes + 1,) uint8.  Index 0 == background (0). Distinct grays else."""
+    """(n_classes + 1,) uint8. Index 0 = background (0), rest are distinct grays."""
     if n_classes <= 1:
         levels = [255]
     else:
@@ -109,7 +101,7 @@ def _make_gray_palette(n_classes: int) -> np.ndarray:
 
 
 def _make_color_palette(n_classes: int) -> np.ndarray:
-    """(n_classes + 1, 3) uint8 RGB palette for *visualization only*. Index 0 = black."""
+    """(n_classes + 1, 3) uint8 RGB palette for visualization. Index 0 = black."""
     cols = [(0, 0, 0)]
     for i in range(max(n_classes, 1)):
         h = i / max(n_classes, 1)
@@ -119,13 +111,7 @@ def _make_color_palette(n_classes: int) -> np.ndarray:
 
 
 def _extract_object_groups(obs: Any) -> List[ObjectObservation]:
-    """
-    Return the list of `ObjectObservation` nodes contained in an observation
-    PyTree, in deterministic (PyTree) order. Non-object leaves (scores, grids,
-    timers, ...) are dropped. Works both eagerly (concrete arrays) and under
-    `jax.jit` (tracer arrays), because it only relies on the PyTree *structure*,
-    which is static for a given game.
-    """
+    """ObjectObservation leaves from obs PyTree, in deterministic PyTree order."""
     leaves = jax.tree_util.tree_leaves(
         obs, is_leaf=lambda n: isinstance(n, ObjectObservation)
     )
@@ -133,11 +119,7 @@ def _extract_object_groups(obs: Any) -> List[ObjectObservation]:
 
 
 def _group_box_arrays(group: ObjectObservation, img_h: int, img_w: int):
-    """
-    Normalize one ObjectObservation group to 1-D int arrays (x, y, w, h) of
-    shape (n,) plus a boolean `valid` of shape (n,). `valid` is False for
-    inactive objects and for boxes that are degenerate or fully off-screen.
-    """
+    """Normalize one ObjectObservation to (x, y, w, h, valid) arrays of shape (n,)."""
     x = jnp.atleast_1d(group.x).astype(jnp.int32)
     y = jnp.atleast_1d(group.y).astype(jnp.int32)
     w = jnp.atleast_1d(group.width).astype(jnp.int32)
@@ -159,11 +141,7 @@ def _group_box_arrays(group: ObjectObservation, img_h: int, img_w: int):
 
 
 def _rasterize_group(x, y, w, h, valid, img_h: int, img_w: int) -> jnp.ndarray:
-    """
-    Vectorized box rasterization for one group.
-    Returns a boolean occupancy mask of shape (img_h, img_w): True wherever any
-    *valid* box of this group covers the pixel.
-    """
+    """Boolean occupancy mask (img_h, img_w): True wherever any valid box covers the pixel."""
     n = x.shape[0]
     ox = x.reshape(n, 1, 1)
     oy = y.reshape(n, 1, 1)
@@ -185,37 +163,17 @@ def _union(group_masks: List[jnp.ndarray]) -> jnp.ndarray:
     return union
 
 
-# --------------------------------------------------------------------------- #
-#  wrapper state                                                                #
-# --------------------------------------------------------------------------- #
 @struct.dataclass
 class OCCAMState:
-    # NOTE: the field MUST be named `atari_state` so that the eval/video code in
-    # jaxtari-blines (which walks `LogState.atari_state.atari_state.env_state`)
-    # keeps working unchanged, exactly like PixelState / ObjectCentricState.
+    # must be named `atari_state` so jaxtari-blines eval code can walk the state tree
     atari_state: Any
-    mask_stack: jnp.ndarray  # (F, C, H, W) uint8, internal stacked masks
+    mask_stack: jnp.ndarray  # (F, C, H, W) uint8
 
 
-# --------------------------------------------------------------------------- #
-#  the wrapper                                                                  #
-# --------------------------------------------------------------------------- #
 class OCCAMWrapper(JaxatariWrapper):
     """
-    Object-Centric Attention via Masking wrapper.
-
-    Apply it AFTER `AtariWrapper`, in place of `PixelObsWrapper`:
-
-        env = jaxatari.make(env_id)
-        env = AtariWrapper(env, sticky_actions=0.0, episodic_life=not eval, ...)
-        env = OCCAMWrapper(env, mask_mode="binary", frame_stack_size=4, frame_skip=4)
-        env = LogWrapper(env)
-
-    Output observation shape (drop-in for the CNN in ppo.py):
-        object/binary/class : (frame_stack_size,                 84, 84, 1)
-        planes              : (frame_stack_size * n_classes,      84, 84, 1)
-    The trailing size-1 axis matches PixelObsWrapper, so ppo.py's `.squeeze()`
-    turns it into (B, F*C, 84, 84) and the CNN handles F*C input channels.
+    Object-Centric Attention via Masking wrapper. Apply after AtariWrapper, in place of PixelObsWrapper.
+    Output shape: (frame_stack_size, 84, 84, 1) for object/binary/class; (frame_stack_size * n_classes, 84, 84, 1) for planes.
     """
 
     def __init__(
@@ -241,78 +199,36 @@ class OCCAMWrapper(JaxatariWrapper):
         self.out_h, self.out_w = int(out_size[0]), int(out_size[1])
         self.game_name = game_name
 
-        # base game env (AtariWrapper stores it in ._env); used for render + obs.
-        self.base_env = env._env
-
-        # native render resolution (e.g. 210 x 160).
+        self.base_env = env._env  # base game env; used for render + obs
         img_shape = self.base_env.image_space().shape  # (H, W, 3)
         self.img_h, self.img_w = int(img_shape[0]), int(img_shape[1])
 
-        # ---- probe the object layout once (eager) to fix the static structure.
+        # probe object layout once to fix the static structure
         probe_obs = self.base_env._get_observation(self.base_env.reset(jax.random.PRNGKey(0))[1])
-        obj_groups = _extract_object_groups(probe_obs)
-        self.num_classes = len(obj_groups)
+        self.num_classes = len(_extract_object_groups(probe_obs))
 
-        # ---- guard rails / informative diagnostics ----------------------------
         if self.num_classes == 0:
             raise NotImplementedError(
                 f"OCCAM: game '{game_name}' exposes no ObjectObservation groups, so no "
-                f"object bounding boxes are available to build masks from. This game "
-                f"needs a small game-specific adapter (or upstream ObjectObservation "
-                f"support in JAXtari) before OCCAM can be used. See the support table "
-                f"printed by `python -m agents.occam.occam`."
+                f"object bounding boxes are available to build masks from."
             )
 
-        # warn if the game also carries grid-structured objects in raw arrays
-        # (e.g. Breakout `blocks`, Frostbite `ice_grid`): those are NOT masked.
-        all_leaves = jax.tree_util.tree_leaves(
-            probe_obs, is_leaf=lambda n: isinstance(n, ObjectObservation)
-        )
-        grid_like = [
-            l for l in all_leaves
-            if (not isinstance(l, ObjectObservation)) and getattr(l, "ndim", 0) >= 2
-        ]
-        if grid_like:
-            warnings.warn(
-                f"OCCAM[{game_name}]: {len(grid_like)} grid-structured field(s) are "
-                f"stored as raw arrays (not ObjectObservation) and will NOT appear in "
-                f"the mask (e.g. Breakout bricks / Frostbite ice). Moving objects are "
-                f"masked normally. Add a game-specific adapter for full fidelity.",
-                stacklevel=2,
-            )
+        self._gray_palette = jnp.asarray(_make_gray_palette(self.num_classes))   # (K+1,)
+        self._color_palette = jnp.asarray(_make_color_palette(self.num_classes)) # (K+1, 3)
 
-        # palettes (numpy at init -> jnp constants at use time)
-        self._gray_palette = jnp.asarray(_make_gray_palette(self.num_classes))      # (K+1,)
-        self._color_palette = jnp.asarray(_make_color_palette(self.num_classes))    # (K+1, 3)
-
-        # channels per single frame: 1 for object/binary/class, K for planes.
         self.per_frame_channels = self.num_classes if mask_mode == "planes" else 1
-
         total_channels = self.frame_stack_size * self.per_frame_channels
-        if total_channels < 2:
-            warnings.warn(
-                f"OCCAM[{game_name}]: frame_stack_size * channels == {total_channels} < 2. "
-                f"jaxtari-blines calls obs.squeeze(), which would collapse a size-1 "
-                f"channel axis and break the CNN. Use frame_stack_size >= 2 (default 4).",
-                stacklevel=2,
-            )
         self._observation_space = spaces.Box(
             low=0, high=255, shape=(total_channels, self.out_h, self.out_w, 1), dtype=jnp.uint8
         )
 
-    # ----- spaces ----------------------------------------------------------- #
     def observation_space(self) -> spaces.Box:
         return self._observation_space
 
-    # ----- mask construction (called inside jit) ---------------------------- #
     def _mask_single(self, frame_rgb: jnp.ndarray, obs: Any) -> jnp.ndarray:
-        """
-        Build the OCCAM representation for a single (native-resolution) frame.
-        Returns (C, out_h, out_w) uint8, with C == self.per_frame_channels.
-        """
+        """Build the OCCAM mask for one native-resolution frame. Returns (C, out_h, out_w) uint8."""
         groups = _extract_object_groups(obs)
-        # per-group occupancy masks at native resolution (list of (H, W) bool)
-        group_masks = []
+        group_masks = []  # (H, W) bool per group
         for g in groups:
             x, y, w, h, valid = _group_box_arrays(g, self.img_h, self.img_w)
             group_masks.append(_rasterize_group(x, y, w, h, valid, self.img_h, self.img_w))
@@ -320,26 +236,19 @@ class OCCAMWrapper(JaxatariWrapper):
         oh, ow = self.out_h, self.out_w
 
         if self.mask_mode == "object":
-            # Keep real grayscale texture inside boxes, zero background, then
-            # bilinear-resize EXACTLY like the pixel baseline's preprocess_image
-            # (same grayscale weights + bilinear) so the two are comparable.
+            # real pixels inside boxes, zero background, bilinear-resize like PixelObsWrapper
             gray = _rgb_to_gray(frame_rgb)                              # (H, W) float
             union = _union(group_masks)
             masked = jnp.where(union, gray, 0.0)[None]                 # (1, H, W)
             out = _resize(masked, (oh, ow), "bilinear")
 
         elif self.mask_mode == "binary":
-            # 1 inside any box, 0 else. Downscale via linear + (>0) threshold so
-            # that even sub-pixel objects (ball, shots) survive the 160->84 step
-            # instead of being dropped by nearest-neighbour sampling.
+            # linear downsample + threshold so sub-pixel objects survive 160->84
             union = _union(group_masks).astype(jnp.float32)[None]      # (1, H, W)
             out = (_resize(union, (oh, ow), "linear") > 0.0).astype(jnp.float32) * 255.0
 
         elif self.mask_mode == "class":
-            # Each box filled with a class-specific gray level. We resize the
-            # per-class coverage with linear interpolation and take an argmax so
-            # small objects survive; a tiny increasing per-class bias reproduces
-            # the "later groups overwrite earlier ones" behaviour on overlaps.
+            # argmax over per-class coverage; tiny bias breaks ties toward later groups
             cov = jnp.stack(
                 [_resize(gm.astype(jnp.float32)[None], (oh, ow), "linear")[0] for gm in group_masks],
                 axis=0,
@@ -351,7 +260,7 @@ class OCCAMWrapper(JaxatariWrapper):
             class_map = jnp.where(any_cov, cls, 0)                      # 0 == background
             out = self._gray_palette[class_map].astype(jnp.float32)[None]
 
-        else:  # "planes": one binary plane per class, stacked on the channel axis
+        else:  # "planes": one binary plane per class
             planes = jnp.stack(
                 [_resize(gm.astype(jnp.float32)[None], (oh, ow), "linear")[0] for gm in group_masks],
                 axis=0,
@@ -361,11 +270,10 @@ class OCCAMWrapper(JaxatariWrapper):
         return jnp.clip(out, 0.0, 255.0).astype(jnp.uint8)
 
     def _stack_to_obs(self, mask_stack: jnp.ndarray) -> jnp.ndarray:
-        """(F, C, H, W) -> (F*C, H, W, 1) uint8 (drop-in for PixelObsWrapper)."""
+        """(F, C, H, W) -> (F*C, H, W, 1) uint8."""
         f, c, h, w = mask_stack.shape
         return mask_stack.reshape(f * c, h, w)[..., None]
 
-    # ----- reset / step ----------------------------------------------------- #
     def _reset_internal(self, key):
         _, atari_state = self._env.reset(key)
         frame = self.base_env.render(atari_state.env_state)
@@ -381,7 +289,7 @@ class OCCAMWrapper(JaxatariWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(self, state: OCCAMState, action: int):
-        # advance `frame_skip` sub-steps, collecting env_states (like PixelObsWrapper)
+        # frame_skip sub-steps
         def body_fn(carry, _):
             atari_state, action = carry
             _, new_atari_state, reward, terminated, truncated, info = self._env.step(
@@ -397,7 +305,7 @@ class OCCAMWrapper(JaxatariWrapper):
 
         last_env_state = jax.tree.map(lambda z: z[-1], env_states)
 
-        # render frame (with anti-flicker max-pooling, matching PixelObsWrapper)
+        # max-pooling anti-flicker, matching PixelObsWrapper
         if self.max_pooling and self.frame_skip > 1:
             img = self.base_env.render(last_env_state)
             prev_env_state = jax.tree.map(lambda z: z[-2], env_states)
@@ -406,7 +314,6 @@ class OCCAMWrapper(JaxatariWrapper):
         else:
             frame = self.base_env.render(last_env_state)
 
-        # object geometry comes from the latest env_state's observation
         obs = self.base_env._get_observation(last_env_state)
         new_mask = self._mask_single(frame, obs)                        # (C, H, W)
         mask_stack = jnp.concatenate(
@@ -419,7 +326,7 @@ class OCCAMWrapper(JaxatariWrapper):
         terminated = terminations.any()
         truncated = truncations.any()
 
-        # autoreset (gym SAME_STEP): reset the whole stack on env_done/truncation
+        # autoreset on done
         mask_stack, occ_state = jax.lax.cond(
             jnp.logical_or(infos["env_done"].any(), truncated),
             lambda: self._reset_internal(atari_state.key),
@@ -438,17 +345,10 @@ class OCCAMWrapper(JaxatariWrapper):
         return obs_out, occ_state, reward, terminated, truncated, info_dict
 
 
-# --------------------------------------------------------------------------- #
-#  visualization: side-by-side  game | mask  video frames                       #
-# --------------------------------------------------------------------------- #
 class _OCCAMViz:
-    """
-    Lightweight helper that turns a sequence of *base* env states into a
-    side-by-side [clean game | OCCAM mask] video. Built fresh from a base env;
-    not used during training, only for logging eval rollouts.
-    """
+    """Side-by-side [game | OCCAM mask] video helper; used only for eval logging."""
 
-    def __init__(self, base_env, mask_mode: str, out_native: bool = True):
+    def __init__(self, base_env, mask_mode: str):
         self.env = base_env
         self.mask_mode = mask_mode
         img_shape = base_env.image_space().shape
@@ -477,7 +377,7 @@ class _OCCAMViz:
             masked = jnp.where(union, gray, 0.0).astype(jnp.uint8)
             rgb = jnp.repeat(masked[..., None], 3, axis=-1)
 
-        else:  # class / planes -> color-code categories (human-friendly)
+        else:  # class / planes -> color-code categories
             class_map = jnp.zeros((self.img_h, self.img_w), dtype=jnp.int32)
             for k, gm in enumerate(group_masks):
                 class_map = jnp.where(gm, k + 1, class_map)
@@ -498,12 +398,7 @@ class _OCCAMViz:
 
 
 def occam_comparison_frames(env_id: str, mask_mode: str, env_states, mods=None):
-    """
-    Build side-by-side [clean | mask] frames for an eval rollout.
-
-    Returns a numpy array of shape (T, H, 2W, 3) uint8 (channel-LAST). Use
-    `_to_chw(...)` to get the (T, 3, H, 2W) layout that `wandb.Video` expects.
-    """
+    """Side-by-side [game | mask] frames (T, H, 2W, 3) uint8 for one eval rollout."""
     import jaxatari  # local import to avoid a hard dependency at module import time
 
     base_env = jaxatari.make(env_id, mods=mods)
@@ -517,7 +412,7 @@ def _to_chw(frames_thwc: np.ndarray) -> np.ndarray:
 
 
 def _load_font(size: int):
-    """Best-effort readable TrueType font; falls back to PIL's bitmap default."""
+    """TrueType font with fallback to PIL bitmap default."""
     try:
         from PIL import ImageFont
         for name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf", "Arial.ttf", "LiberationSans-Regular.ttf"):
@@ -532,7 +427,7 @@ def _load_font(size: int):
 
 def _text_banner(width: int, text: str, height: int, font_size: int = 16,
                  bg=(255, 255, 255), fg=(0, 0, 0)) -> np.ndarray:
-    """A (height, width, 3) banner filled with `bg`, left-aligned `text` in `fg`."""
+    """(height, width, 3) banner with left-aligned text."""
     banner = np.full((height, width, 3), 0, np.uint8)
     banner[:] = np.array(bg, np.uint8)
     try:
@@ -540,7 +435,6 @@ def _text_banner(width: int, text: str, height: int, font_size: int = 16,
         im = Image.fromarray(banner)
         d = ImageDraw.Draw(im)
         font = _load_font(font_size)
-        # vertically center the text within the banner
         try:
             bbox = d.textbbox((0, 0), text, font=font)
             ty = max(0, (height - (bbox[3] - bbox[1])) // 2 - bbox[1])
@@ -554,8 +448,7 @@ def _text_banner(width: int, text: str, height: int, font_size: int = 16,
 
 
 def _caption_clip(frames_thwc: np.ndarray, text: str, banner_h: int = 16) -> np.ndarray:
-    """Prepend a black caption banner with `text` on top of every frame.
-    Uses PIL if available; otherwise the banner stays blank (still aligns sizes)."""
+    """Prepend a caption banner on every frame; uses PIL if available."""
     T, H, W, C = frames_thwc.shape
     banner = np.zeros((banner_h, W, 3), np.uint8)
     try:
@@ -570,8 +463,7 @@ def _caption_clip(frames_thwc: np.ndarray, text: str, banner_h: int = 16) -> np.
 
 
 def _write_video_file(path: str, frames_thwc: np.ndarray, fps: int = 30) -> str | None:
-    """Write a shareable video file. Tries mp4 (imageio/ffmpeg), falls back to gif.
-    Returns the actual path written, or None if no writer is available."""
+    """Write mp4 or gif; returns actual path written, or None."""
     import os
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     try:
@@ -589,16 +481,7 @@ def _write_video_file(path: str, frames_thwc: np.ndarray, fps: int = 30) -> str 
 
 def save_eval_frames(save_dir: str, mod_label: str, frames_thwc: np.ndarray,
                      fps: int = 30, write_mp4: bool = False):
-    """Persist one variant's eval clip so the final summary can pick it up later.
-    Writes `<save_dir>/eval_<mod_label>.npy` (overwritten each call -> holds the
-    LAST step).
-
-    By default it writes ONLY the .npy (pure numpy, no subprocess), so this is
-    safe to call from inside the multithreaded JAX training process: no
-    `os.fork()` / ffmpeg, hence no fork-deadlock warning. The shareable mp4 is
-    built once at the very end by `build_occam_summary_video`. Pass
-    `write_mp4=True` only if you explicitly want a per-variant clip during
-    training (and accept the fork warning)."""
+    """Write frames to <save_dir>/eval_<mod_label>.npy; mp4 only if write_mp4=True."""
     import os
     os.makedirs(save_dir, exist_ok=True)
     np.save(os.path.join(save_dir, f"eval_{mod_label}.npy"), frames_thwc)
@@ -618,27 +501,9 @@ def log_occam_comparison_video(
     wandb_run=None,
     log_wandb: bool = True,
 ):
-    """
-    Render a side-by-side [game | mask] clip for one eval rollout, log it to W&B
-    (per-variant preview) and/or persist it for the final summary.
-
-    Fork-safety note: the only step that can spawn an `os.fork()`/ffmpeg
-    subprocess is the W&B mp4 encoding (`log_wandb=True`). Because the ppo patch
-    only calls this on the LAST step(s) (gated by `VIDEO_EVERY`), that encode
-    happens once at the very end of training, when JAX is no longer actively
-    computing -> safe in practice. The `.npy` written via `save_dir` is pure
-    numpy (no subprocess) and is what `build_occam_summary_video` reads later.
-
-    - W&B key:  `eval/<env_id>/<mask_mode>/<mod_label>`  (game name included).
-    - If `save_dir` is given, also writes `<save_dir>/eval_<mod_label>.npy`.
-    - Set `log_wandb=False` to skip W&B entirely (then no fork at all).
-
-    Returns the captioned numpy frames (T, H, 2W+banner, 3) uint8.
-    """
+    """Render, optionally save (.npy), caption and W&B-log a [game | mask] eval clip."""
     frames = occam_comparison_frames(env_id, mask_mode, env_states, mods=mods)   # (T,H,2W,3) RAW
     if save_dir is not None:
-        # save the RAW (un-captioned) clip; the summary adds its own single, clean
-        # caption later, so nothing is labelled twice.
         save_eval_frames(save_dir, mod_label, frames, fps=fps)
     captioned = _caption_clip(frames, f"{env_id} | {mask_mode} | {mod_label} | step {step}")
     if log_wandb:
@@ -646,14 +511,6 @@ def log_occam_comparison_video(
         key = f"eval/{env_id}/{mask_mode}/{mod_label}"
         (wandb_run or wandb).log({key: wandb.Video(_to_chw(captioned), fps=fps, format="mp4")}, step=step)
     return captioned
-
-
-def _pad_to_len(clip: np.ndarray, T: int) -> np.ndarray:
-    """Repeat the last frame so `clip` reaches length T (for time-aligned tiling)."""
-    if clip.shape[0] >= T:
-        return clip[:T]
-    pad = np.broadcast_to(clip[-1:], (T - clip.shape[0],) + clip.shape[1:])
-    return np.concatenate([clip, pad], axis=0)
 
 
 def build_occam_summary_video(
@@ -673,31 +530,9 @@ def build_occam_summary_video(
     wandb_run_name: str | None = None,
 ):
     """
-    Stitch the LAST saved eval clips of all variants into ONE shareable video,
-    showing everything at once.
-
-    Layout: columns = the 4 variants (object, binary, class, planes),
-            rows    = the eval mods (`default` on top, `lazy_enemy` below).
-    Each cell is the `[game | mask]` clip of that (variant, mod) with ONE readable
-    caption. Missing combinations become a labelled placeholder. Shorter clips
-    hold their last frame so everything stays time-synced; the output length
-    equals the longest eval clip, and the final frame is then HELD for
-    `hold_last_seconds` so every result is clearly visible at the end (instead of
-    appearing to snap back to the start).
-
-    Memory: clips are memory-mapped and the grid is streamed FRAME-BY-FRAME to the
-    encoder, so peak RAM is ~one output frame regardless of episode length.
-
-    - `strip_top_px`: crop this many rows off the top of each saved clip before
-      tiling. Use it only for OLD clips that were saved WITH a baked-in caption
-      (set 16); clips saved by the current code are raw, so leave it 0.
-    - W&B upload: if `wandb_project` is given, the finished video is uploaded as
-      its OWN new W&B run (named `wandb_run_name`, tagged `wandb_tags`,
-      job_type="summary"), so repeated runs are preserved and comparable. This
-      references the already-written mp4 file (no re-encode, no fork).
-
-    Writes `<save_root>/<env_id>/<out_name or summary_<env_id>>.mp4` (falls back to
-    .gif if no ffmpeg is available). Returns `(path_written_or_None, num_frames)`.
+    Stitch all saved eval clips into one summary video.
+    Columns = 4 mask variants, rows = eval mods. Clips are memory-mapped; frames stream to the encoder.
+    Returns (path_written_or_None, num_frames).
     """
     import os
     import glob
@@ -706,7 +541,7 @@ def build_occam_summary_video(
     while len(grid_order) < 4:
         grid_order.append(None)
 
-    # auto-discover the eval mod-labels from the saved clips if not given
+    # auto-discover mod labels from saved clips
     if not mods:
         found = set()
         for mm in grid_order:
@@ -724,13 +559,11 @@ def build_occam_summary_video(
         p = os.path.join(save_root, env_id, mask_mode, f"eval_{mod}.npy")
         if not os.path.exists(p):
             return None
-        # memory-map: frames are pulled from disk one at a time during streaming,
-        # so a multi-GB clip is never fully resident in RAM.
-        return np.load(p, mmap_mode="r")
+        return np.load(p, mmap_mode="r")  # mmap: one frame at a time, avoids loading full clip
 
     mods = sorted(mods, key=lambda m: (m != "default", m))   # "default" first
 
-    # open every (mod, variant) clip as a memmap; remember the longest length
+    # open all clips as memmaps; track longest length
     clips = {}
     cell_h = cell_w = None
     max_len = 0
@@ -744,20 +577,20 @@ def build_occam_summary_video(
     if cell_h is None:
         return None, None
 
-    # output length: full by default; `max_frames` (if set) strides it down
+    # stride if max_frames set
     if max_frames and max_len > max_frames:
         out_idx = np.linspace(0, max_len - 1, max_frames).astype(np.int64)
     else:
         out_idx = np.arange(max_len, dtype=np.int64)
     T = len(out_idx)
 
-    BG = (255, 255, 255)   # white background / gaps
-    FG = (0, 0, 0)         # black text
-    bw = 4                 # cell border width (doubled)
-    col_gap = 26           # horizontal gap between the 4 variant cells
-    row_gap = 18           # vertical gap between mod rows
+    BG = (255, 255, 255)
+    FG = (0, 0, 0)
+    bw = 4        # cell border width
+    col_gap = 26  # horizontal gap between cells
+    row_gap = 18  # vertical gap between rows
 
-    # pre-render the static banners ONCE (text is constant per cell)
+    # pre-render static banners
     cap_h, title_h = 24, 34
     cell_banner = {
         (mod, mm): _text_banner(
@@ -773,16 +606,16 @@ def build_occam_summary_video(
                          f"{env_id}  -  OCCAM mask comparison", title_h, font_size=24, bg=BG, fg=FG)
 
     full_cell_h = cap_h + eff_h
-    h_spacer = np.full((full_cell_h, col_gap, 3), 255, np.uint8)        # white gap between cells
+    h_spacer = np.full((full_cell_h, col_gap, 3), 255, np.uint8)
     row_w = cell_w * 4 + col_gap * 3
-    v_spacer = np.full((row_gap, row_w, 3), 255, np.uint8)             # white gap between rows
+    v_spacer = np.full((row_gap, row_w, 3), 255, np.uint8)
 
     def _decorate(frame):
-        """Thick white border around the [game|mask] cell + a divider between halves."""
-        f = np.array(frame, dtype=np.uint8)          # writable copy
+        """White border + game|mask divider line."""
+        f = np.array(frame, dtype=np.uint8)
         h, w = f.shape[:2]
         mid = w // 2
-        f[:, max(0, mid - bw // 2):mid + (bw - bw // 2)] = 255    # game | mask divider (black)
+        f[:, max(0, mid - bw // 2):mid + (bw - bw // 2)] = 255
         f[:bw, :] = 255
         f[-bw:, :] = 255
         f[:, :bw] = 255
@@ -798,17 +631,15 @@ def build_occam_summary_video(
                 if c is None:
                     frame = black_cell
                 else:
-                    frame = np.asarray(c[min(t_src, c.shape[0] - 1)])[strip_top_px:]   # one frame
+                    frame = np.asarray(c[min(t_src, c.shape[0] - 1)])[strip_top_px:]
                 cell = np.concatenate([cell_banner[(mod, mm)], _decorate(frame)], axis=0)
                 cells.append(cell)
-            # interleave cells with white horizontal spacers
             row_parts = []
             for i, cell in enumerate(cells):
                 if i:
                     row_parts.append(h_spacer)
                 row_parts.append(cell)
             row_imgs.append(np.concatenate(row_parts, axis=1))
-        # interleave rows with white vertical spacers
         grid_parts = []
         for i, ri in enumerate(row_imgs):
             if i:
@@ -817,9 +648,7 @@ def build_occam_summary_video(
         grid = np.concatenate(grid_parts, axis=0)
         return np.concatenate([title, grid], axis=0)
 
-    # stream the frames straight to the encoder -> peak RAM is ~one output frame.
-    # After the last real frame, HOLD it for `hold_last_seconds` so the end state
-    # of every cell stays on screen instead of appearing to jump back to start.
+    # stream frames to encoder; hold last frame for hold_last_seconds
     out_name = out_name or f"summary_{env_id}.mp4"
     out_path = os.path.join(save_root, env_id, out_name)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -847,7 +676,7 @@ def build_occam_summary_video(
     except Exception:
         written = None
 
-    # upload as its OWN tagged W&B run (preserved + comparable across re-runs)
+    # upload as own W&B run for persistence across re-runs
     if wandb_project and written is not None:
         try:
             import wandb
@@ -885,13 +714,8 @@ JAXTARI_15 = [
 
 
 def probe_game(env_id: str):
-    """
-    Probe a single game and classify its OCCAM support:
-        "full"    : >=1 ObjectObservation group, no raw grid objects
-        "partial" : >=1 ObjectObservation group + raw grid object(s) (ignored)
-        "none"    : no ObjectObservation groups (needs an adapter)
-    Returns (status, num_object_groups, num_grid_fields, error_or_None).
-    """
+    """Classify OCCAM support for one game.
+    Returns (status, num_object_groups, num_grid_fields, error_or_None)."""
     import jaxatari
     try:
         env = jaxatari.make(env_id)
@@ -911,7 +735,7 @@ def probe_game(env_id: str):
         return "error", 0, 0, repr(e)
 
 
-def print_support_table(games=None):  # pragma: no cover - convenience CLI
+def print_support_table(games=None):  # pragma: no cover
     games = games or JAXTARI_15
     print(f"{'game':<20}{'status':<10}{'#obj groups':<13}{'#grid fields':<13}note")
     print("-" * 72)
