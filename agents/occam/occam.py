@@ -703,9 +703,7 @@ def build_occam_summary_video(
     return written, T
 
 
-# --------------------------------------------------------------------------- #
-#  utility: per-game OCCAM support report (run:  python -m agents.occam.occam)  #
-# --------------------------------------------------------------------------- #
+
 JAXTARI_15 = [
     "asteroids", "beamrider", "breakout", "enduro", "freeway", "frostbite",
     "gravitar", "kangaroo", "montezumarevenge", "mspacman", "phoenix", "pong",
