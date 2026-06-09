@@ -1,8 +1,8 @@
 """
-OCCAM: Object-Centric Attention via Masking  --  JAX / JAXtari baseline
-=======================================================================
+OCCAM: Object-Centric Attention via Masking  -  JAXtari baseline
 
-A single-file, JIT-compatible implementation of OCCAM as an observation
+
+A reimplementation of OCCAM as an observation
 wrapper for JAXtari (https://github.com/k4ntz/JAXAtari), intended as a
 neuro-symbolic baseline for https://github.com/remunds/jaxtari-blines.
 
@@ -12,27 +12,6 @@ Original method:
     Reference code: https://github.com/VanillaWhey/OCAtariWrappers
 This file re-implements the *idea* (object-centric masking) natively in JAX.
 
-KEY DIFFERENCE TO THE ORIGINAL (must be stated in the report!):
-    The original OCCAM extracts object bounding boxes with a lightweight
-    *detector* operating on the raw frames (motion / optical flow / a learned
-    detector), because OCAtari/ALE does not hand out clean object boxes.
-    JAXtari instead exposes ground-truth object bounding boxes for every game
-    via the `ObjectObservation` dataclass (x, y, width, height, active,
-    visual_id, ...). We therefore build the masks directly from these
-    ground-truth boxes -- no frame-differencing / detector is needed. This is
-    in the spirit of the paper (which treats the detector purely as overhead),
-    but it removes the (noisy) detection step and should be disclosed.
-
-WHY THIS IS A *NEURO-SYMBOLIC* BASELINE:
-    OCCAM injects *symbolic, structured object knowledge* (which entities exist,
-    where they are, and -- for Class/Planes masks -- which category each entity
-    belongs to) as a hard-attention inductive bias into a *neural* (CNN) policy.
-    The "symbolic" part is the object extraction (positions + categories); the
-    "neural" part is the convolutional policy that learns on top of the masked
-    input. The Class Masks and Planes variants are the most strongly
-    neuro-symbolic (they encode symbolic object *categories*), while the paper
-    deliberately shows you do NOT need a *full* symbolic state vector (à la
-    OCAtari's semantic vector) to get the robustness benefit.
 
 THE FOUR OCCAM ABSTRACTION LEVELS (all implemented here, selected via
 `mask_mode`); see Sec. 2.2 / Figure 3 of the paper:
