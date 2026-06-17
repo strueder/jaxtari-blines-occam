@@ -17,9 +17,10 @@ Any extra KEY=VALUE pairs are forwarded to main.py as Hydra overrides, e.g.:
     ... uv run python run_occam_all.py ENV_ID=seaquest TOTAL_TIMESTEPS=2000000 NUM_ENVS=16
     ... uv run python run_occam_all.py ENV_ID=pong VARIANTS=binary,class   # subset
 
-Outputs:
-    <SAVE_ROOT>/<ENV_ID>/<variant>/      per-variant checkpoints + eval clips
-    <SAVE_ROOT>/<ENV_ID>/summary_<ENV_ID>.mp4   <-- the shareable video
+Outputs (LABEL namespaces everything so parallel runs don't clobber each other):
+    <SAVE_ROOT>/<LABEL>/<ENV_ID>/<variant>/   per-variant checkpoints + eval clips
+    <SAVE_ROOT>/<LABEL>/<ENV_ID>/summary_<ENV_ID>.mp4   <-- the shareable video
+    (LABEL omitted -> <SAVE_ROOT>/<ENV_ID>/... as before, backward compatible)
 """
 import os
 import sys
@@ -49,9 +50,12 @@ def main():
     label = ov.get("LABEL", "")
     forwarded = [f"{k}={v}" for k, v in ov.items() if k not in _LAUNCHER_KEYS]
 
+
+    save_root_eff = os.path.join(save_root, label) if label else save_root
+
     for mm in variants:
         exp_name = f"occam_{env_id}_{mm}" + (f"_{label}" if label else "")
-        save_path = os.path.join(save_root, env_id, mm)
+        save_path = os.path.join(save_root_eff, env_id, mm)
         cmd = [
             "uv", "run", "python", "main.py", "--config-name", "occam",
             f"ENV_ID={env_id}", f"MASK_MODE={mm}",
@@ -82,7 +86,8 @@ def main():
 
     steps = ov.get("TOTAL_TIMESTEPS", "default")
     path, nframes = build_occam_summary_video(
-        env_id, save_root, mods=None,            # auto-discovers eval mods
+        env_id, save_root_eff, mods=None,        
+        mask_modes=variants,                     
         wandb_project=project, wandb_entity=entity,
         wandb_tags=["summary", env_id, f"steps:{steps}"] + ([label] if label else []),
         wandb_run_name=f"summary_{env_id}_{int(time.time())}",
