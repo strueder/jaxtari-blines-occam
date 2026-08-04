@@ -711,7 +711,7 @@ with-cuda = [
 [[package]]
 name = "jaxatari"
 version = "0.1.0"
-source = { git = "https://github.com/strueder/JAXAtari/?rev=kingkong#28afe00b13ee8131513ed1af9d34dc36a55bcf1d" }
+source = { git = "https://github.com/strueder/JAXAtari/?rev=test%2Fkingkong-observation-all#fce75fd3f364b077053dc590ed7872afaced00b1" }
 dependencies = [
     { name = "absl-py" },
     { name = "ale-py" },
@@ -782,7 +782,7 @@ requires-dist = [
     { name = "imageio", specifier = ">=2.37.3" },
     { name = "imageio-ffmpeg", specifier = ">=0.6.0" },
     { name = "jax", extras = ["cuda12"], specifier = ">=0.4.38" },
-    { name = "jaxatari", git = "https://github.com/strueder/JAXAtari/?rev=kingkong" },
+    { name = "jaxatari", git = "https://github.com/strueder/JAXAtari/?rev=test%2Fkingkong-observation-all" },
     { name = "rtpt", specifier = ">=0.0.4" },
     { name = "wandb", extras = ["media"], specifier = ">=0.27.0" },
 ]

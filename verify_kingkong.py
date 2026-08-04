@@ -16,13 +16,14 @@ import os
 import jax
 import jax.numpy as jnp
 import numpy as np
-import imageio.v2 as imageio
+import imageio.v3 as iio
 
 import jaxatari
 from jaxatari.wrappers import AtariWrapper
 from agents.occam.occam import (
     OCCAMWrapper, _OCCAMViz, _load_font, _make_color_palette,
     _planes_isometric_rgb, _area_weights, _sheets_width,
+    _strip, _legend_strip, LEG_LINE_H, HEAD_H,
 )
 
 OUT_H, OUT_W = 84, 84
@@ -42,55 +43,6 @@ REQUIRED = ("x", "y", "width", "height", "active")
 # --------------------------------------------------------------------------
 
 TITLE_H = 22      # row title banner
-HEAD_H = 16       # per-panel name banner
-LEG_LINE_H = 15   # one legend line
-
-
-def _strip(width, height, text, fill=(255, 255, 255), font_size=13):
-    """Black banner of the given size with left-aligned text."""
-    band = np.zeros((height, width, 3), np.uint8)
-    try:
-        from PIL import Image, ImageDraw
-        im = Image.fromarray(band)
-        d = ImageDraw.Draw(im)
-        d.text((4, max(0, (height - font_size) // 2 - 1)), text,
-               fill=fill, font=_load_font(font_size))
-        band = np.asarray(im)
-    except Exception:
-        pass
-    return band
-
-
-def _legend_strip(width, entries, font_size=13):
-    """Colour key for the obs-box groups: [(name, n_active, rgb)] -> black banner.
-
-    Uses a fixed slot grid derived only from the *number* of groups (constant for
-    a game), so every frame of the video gets the exact same banner height.
-    """
-    n = max(1, len(entries))
-    rows = 1 if n <= 6 else (n + 5) // 6   # height depends on the group *count* only
-    band = np.zeros((rows * LEG_LINE_H + 4, width, 3), np.uint8)
-    try:
-        from PIL import Image, ImageDraw
-    except Exception:
-        return band
-    im = Image.fromarray(band)
-    d = ImageDraw.Draw(im)
-    font = _load_font(font_size)
-
-    prefix = "obs boxes:"
-    d.text((5, 3), prefix, fill=(150, 150, 150), font=font)
-    x = 5 + int(d.textlength(prefix, font=font)) + 10
-    y = 2
-    per_row = (n + rows - 1) // rows
-    for i, (name, n_act, col) in enumerate(entries):
-        if i and i % per_row == 0:          # next line
-            x, y = 5, y + LEG_LINE_H
-        d.rectangle([x, y + 4, x + 7, y + 11], fill=col)
-        text = f"{name} ({n_act})"
-        d.text((x + 13, y + 1), text, fill=col, font=font)
-        x += 13 + int(d.textlength(text, font=font)) + 16
-    return np.asarray(im)
 
 
 def _obs_groups(obs):
@@ -400,10 +352,10 @@ def main():
         frames.extend([row] * args.hold)
         if args.png:
             safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in title)
-            imageio.imwrite(os.path.join(png_dir, f"{i:02d}_{safe}.png"), row)
+            iio.imwrite(os.path.join(png_dir, f"{i:02d}_{safe}.png"), row)
         print(f"[{i:02d}] {title}")
 
-iio.imwrite(args.out, np.asarray(frames, dtype=np.uint8),
+    iio.imwrite(args.out, np.asarray(frames, dtype=np.uint8),
                 plugin="pyav", codec="libx264", fps=args.fps)
     print(f"\nwrote {args.out}  ({len(situations)} situations, {len(frames)} frames)")
     src = f"OCCAMWrapper._mask_single (real {OUT_H}x{OUT_W} training masks)" if args.obs_res \

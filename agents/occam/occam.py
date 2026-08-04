@@ -297,6 +297,21 @@ def _group_masks(obs: Any, img_h: int, img_w: int) -> List[jnp.ndarray]:
     ]
 
 
+def _group_outlines(obs: Any, img_h: int, img_w: int) -> List[jnp.ndarray]:
+    """One (H, W) boolean 1px box outline per ObjectObservation group.
+
+    Full box minus the box eroded by one pixel -- same result as PIL's
+    rectangle(outline=...), but jit/vmap-compatible.
+    """
+    outs = []
+    for g in _extract_object_groups(obs):
+        x, y, w, h, valid = _group_box_arrays(g, img_h, img_w)
+        full = _rasterize_group(x, y, w, h, valid, img_h, img_w)
+        inner = _rasterize_group(x + 1, y + 1, w - 2, h - 2, valid, img_h, img_w)
+        outs.append(full & ~inner)
+    return outs
+
+
 def _class_map(group_masks: List[jnp.ndarray], order: List[int] | None = None) -> jnp.ndarray:
     """(H, W) int32 class ids, 1..K with 0 = background.
 
@@ -516,7 +531,8 @@ class _OCCAMViz:
 
         probe = base_env._get_observation(base_env.reset(jax.random.PRNGKey(0))[1])
         self.num_classes = len(_extract_object_groups(probe))
-        self.render_order = _render_order(base_env, _group_names(probe))
+        self.group_names = _group_names(probe)
+        self.render_order = _render_order(base_env, self.group_names)
         self._gray_palette = jnp.asarray(_make_gray_palette(self.num_classes))
         self._color_palette = jnp.asarray(_make_color_palette(self.num_classes))
         self._w_y = jnp.asarray(_area_weights(self.img_h, self.out_h), dtype=jnp.float32)
@@ -536,6 +552,14 @@ class _OCCAMViz:
             return masks
         f = _area_resize(masks.astype(jnp.float32), self._w_y, self._w_x)
         return f > 0.0
+
+    def _boxes_rgb(self, frame_rgb: jnp.ndarray, obs: Any) -> jnp.ndarray:
+        """Clean frame with one class-coloured box outline per group, (H, W, 3) uint8."""
+        out = frame_rgb.astype(jnp.int32)
+        for gi, edge in enumerate(_group_outlines(obs, self.img_h, self.img_w)):
+            out = jnp.where(edge[..., None],
+                            self._color_palette[gi + 1].astype(jnp.int32), out)
+        return out.astype(jnp.uint8)
 
     def _mask_rgb(self, frame_rgb: jnp.ndarray, obs: Any) -> jnp.ndarray:
         """Native-resolution RGB visualization (H, W, 3) uint8 of the mask."""
@@ -566,34 +590,146 @@ class _OCCAMViz:
         clean = self.env.render(env_state).astype(jnp.uint8)
         obs = self.env._get_observation(env_state)
         mask_rgb = self._mask_rgb(clean, obs)
+        boxes = self._boxes_rgb(clean, obs)
         panel = self._to_obs_res(clean) if self.obs_res else clean
+        boxes = self._to_obs_res(boxes) if self.obs_res else boxes
         if self.mask_mode != "planes":
-            return jnp.concatenate([panel, mask_rgb], axis=1)
+            return jnp.concatenate([panel, boxes, mask_rgb], axis=1)
         h, w = panel.shape[0], panel.shape[1]
         sheets = _planes_isometric_rgb(
             self.planes_rgb(obs), self._color_palette,
             h, _sheets_width(w, self.num_classes), aspect=w / h,
         )
-        return jnp.concatenate([panel, mask_rgb, sheets], axis=1)
+        return jnp.concatenate([panel, boxes, mask_rgb, sheets], axis=1)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _counts(self, env_state) -> jnp.ndarray:
+        """(K,) int32 active, on-screen boxes per group."""
+        obs = self.env._get_observation(env_state)
+        return jnp.stack([
+            _group_box_arrays(g, self.img_h, self.img_w)[4].sum().astype(jnp.int32)
+            for g in _extract_object_groups(obs)
+        ])
+
+    def counts(self, env_states) -> jnp.ndarray:
+        """(T, ...) base env states -> (T, K) int32."""
+        return jax.vmap(self._counts)(env_states)
+
+    def panel_layout(self) -> List[Tuple[str, int]]:
+        """[(panel name, width)] in the order _frame concatenates them."""
+        w = self.out_w if self.obs_res else self.img_w
+        base = [("clean", w), ("obs boxes", w), (self.mask_mode, w)]
+        if self.mask_mode != "planes":
+            return base
+        return base + [("planes (sheets)", _sheets_width(w, self.num_classes))]
 
     def frames(self, env_states) -> jnp.ndarray:
-        """(T, ...) base env states -> (T, H, W_row, 3) uint8; 3 panels in planes mode."""
+        """(T, ...) base env states -> (T, H, W_row, 3) uint8; 4 panels in planes mode."""
         return jax.vmap(self._frame)(env_states)
 
 
 def occam_comparison_frames(env_id: str, mask_mode: str, env_states, mods=None,
-                            obs_res: bool = False):
-    """Side-by-side [game | mask] frames (T, H, 2W, 3) uint8 for one eval rollout."""
+                            obs_res: bool = False, return_meta: bool = False):
+    """[clean | obs boxes | mask (| sheets)] frames (T, H, W_row, 3) uint8 per eval rollout.
+
+    return_meta=True additionally returns the layout the summary video needs to re-cut
+    the row: panel names/widths, banner heights, group colours and per-frame counts.
+    """
     import jaxatari  # local import to avoid a hard dependency at module import time
 
     base_env = jaxatari.make(env_id, mods=mods)
     viz = _OCCAMViz(base_env, mask_mode, obs_res=obs_res)
-    return np.asarray(viz.frames(env_states), dtype=np.uint8)         # (T, H, 2W, 3)
+    frames = np.asarray(viz.frames(env_states), dtype=np.uint8)
+    counts = np.asarray(viz.counts(env_states), dtype=np.int32)
+    palette = np.asarray(_make_color_palette(viz.num_classes))
+    layout = viz.panel_layout()
+    total_w = frames.shape[2]
+
+    header = np.concatenate([_strip(w, HEAD_H, name) for name, w in layout], axis=1)
+    header = np.pad(header, [(0, 0), (0, max(0, total_w - header.shape[1])), (0, 0)])[:, :total_w]
+
+    cache = {}
+    out = []
+    for t in range(frames.shape[0]):
+        key = tuple(int(c) for c in counts[t])
+        if key not in cache:
+            entries = [(n, key[i], tuple(int(c) for c in palette[i + 1]))
+                       for i, n in enumerate(viz.group_names)]
+            cache[key] = _legend_strip(total_w, entries)
+        out.append(np.concatenate([cache[key], header, frames[t]], axis=0))
+    stacked = np.stack(out)
+    if not return_meta:
+        return stacked
+
+    meta = {
+        "mask_mode": mask_mode,
+        "panels": [[name, int(w)] for name, w in layout],
+        "legend_h": int(_legend_height(len(viz.group_names))),
+        "head_h": int(HEAD_H),
+        "groups": list(viz.group_names),
+        "colors": [[int(c) for c in palette[i + 1]] for i in range(viz.num_classes)],
+        "counts": counts.tolist(),
+    }
+    return stacked, meta
 
 
 def _to_chw(frames_thwc: np.ndarray) -> np.ndarray:
     """(T, H, W, 3) -> (T, 3, H, W) contiguous, for wandb.Video."""
     return np.ascontiguousarray(np.transpose(frames_thwc, (0, 3, 1, 2)))
+
+
+LEG_LINE_H = 15
+HEAD_H = 16
+TITLE_H = 22
+
+
+def _legend_height(n_entries: int) -> int:
+    """Height _legend_strip produces for n entries -- lets the summary cut it off again."""
+    n = max(1, int(n_entries))
+    rows = 1 if n <= 6 else (n + 5) // 6
+    return rows * LEG_LINE_H + 4
+
+
+def _strip(width, height, text, fill=(255, 255, 255), font_size=13):
+    """Black banner of the given size with left-aligned text."""
+    band = np.zeros((height, width, 3), np.uint8)
+    try:
+        from PIL import Image, ImageDraw
+        im = Image.fromarray(band)
+        d = ImageDraw.Draw(im)
+        d.text((4, max(0, (height - font_size) // 2 - 1)), text,
+               fill=fill, font=_load_font(font_size))
+        band = np.asarray(im)
+    except Exception:
+        pass
+    return band
+
+
+def _legend_strip(width, entries, font_size=13):
+    """Colour key for the object groups: [(name, n_active, rgb)] -> black banner."""
+    n = max(1, len(entries))
+    rows = 1 if n <= 6 else (n + 5) // 6
+    band = np.zeros((_legend_height(n), width, 3), np.uint8)
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return band
+    im = Image.fromarray(band)
+    d = ImageDraw.Draw(im)
+    font = _load_font(font_size)
+    prefix = "obs boxes:"
+    d.text((5, 3), prefix, fill=(150, 150, 150), font=font)
+    x = 5 + int(d.textlength(prefix, font=font)) + 10
+    y = 2
+    per_row = (n + rows - 1) // rows
+    for i, (name, n_act, col) in enumerate(entries):
+        if i and i % per_row == 0:
+            x, y = 5, y + LEG_LINE_H
+        d.rectangle([x, y + 4, x + 7, y + 11], fill=col)
+        text = name if n_act is None else f"{name} ({n_act})"
+        d.text((x + 13, y + 1), text, fill=col, font=font)
+        x += 13 + int(d.textlength(text, font=font)) + 16
+    return np.asarray(im)
 
 
 def _load_font(size: int):
@@ -644,7 +780,8 @@ def _caption_clip(frames_thwc: np.ndarray, text: str, banner_h: int = 16) -> np.
     except Exception:
         pass
     banner = np.broadcast_to(banner, (T, banner_h, W, 3))
-    return np.concatenate([banner, frames_thwc], axis=1)
+    out = np.concatenate([banner, frames_thwc], axis=1)
+    return np.pad(out, [(0, 0), (0, out.shape[1] % 2), (0, out.shape[2] % 2), (0, 0)])
 
 
 def _write_video_file(path: str, frames_thwc: np.ndarray, fps: int = 30) -> str | None:
@@ -652,24 +789,25 @@ def _write_video_file(path: str, frames_thwc: np.ndarray, fps: int = 30) -> str 
     import os
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     try:
-        import imageio
-        try:
-            imageio.mimwrite(path, list(frames_thwc), fps=fps, macro_block_size=None)
-            return path
-        except Exception:
-            gif = os.path.splitext(path)[0] + ".gif"
-            imageio.mimwrite(gif, list(frames_thwc), duration=1.0 / fps)
-            return gif
-    except Exception:
+        import imageio.v3 as iio
+        iio.imwrite(path, np.asarray(frames_thwc, dtype=np.uint8),
+                    plugin="pyav", codec="libx264", fps=fps)
+        return path
+    except Exception as e:
+        print(f"[warn] video encode failed: {e}")
         return None
 
 
 def save_eval_frames(save_dir: str, mod_label: str, frames_thwc: np.ndarray,
-                     fps: int = 30, write_mp4: bool = False):
-    """Write frames to <save_dir>/eval_<mod_label>.npy; mp4 only if write_mp4=True."""
+                     fps: int = 30, write_mp4: bool = False, meta: dict | None = None):
+    """Write frames to <save_dir>/eval_<mod_label>.npy (+ .json layout sidecar)."""
     import os
+    import json
     os.makedirs(save_dir, exist_ok=True)
     np.save(os.path.join(save_dir, f"eval_{mod_label}.npy"), frames_thwc)
+    if meta is not None:
+        with open(os.path.join(save_dir, f"eval_{mod_label}.json"), "w") as f:
+            json.dump(meta, f)
     if write_mp4:
         _write_video_file(os.path.join(save_dir, f"eval_{mod_label}.mp4"), frames_thwc, fps=fps)
 
@@ -688,10 +826,10 @@ def log_occam_comparison_video(
     obs_res: bool = False,
 ):
     """Render, optionally save (.npy), caption and W&B-log a [game | mask] eval clip."""
-    frames = occam_comparison_frames(env_id, mask_mode, env_states, mods=mods,
-                                     obs_res=obs_res)
+    frames, meta = occam_comparison_frames(env_id, mask_mode, env_states, mods=mods,
+                                           obs_res=obs_res, return_meta=True)
     if save_dir is not None:
-        save_eval_frames(save_dir, mod_label, frames, fps=fps)
+        save_eval_frames(save_dir, mod_label, frames, fps=fps, meta=meta)
     captioned = _caption_clip(frames, f"{env_id} | {mask_mode} | {mod_label} | step {step}")
     if log_wandb:
         import wandb
@@ -717,58 +855,65 @@ def build_occam_summary_video(
     wandb_run_name: str | None = None,
 ):
     """
-    Stitch all saved eval clips into one summary video.
-    Columns = 4 mask variants, rows = eval mods. Clips are memory-mapped; frames stream to the encoder.
+    Stitch the saved eval clips into one summary video: one row per (mod, mask mode).
+
+    Every variant trains its own policy and therefore has its own rollout, so each row
+    keeps its own clean frame and obs-boxes overlay -- panels are never shared across
+    modes. A row is the saved clip minus its baked-in legend: [clean | obs boxes | mask],
+    and [clean | obs boxes | planes | planes sheets] for planes, which makes that row
+    wider; narrower rows are padded to the same width. The group colours are identical
+    across variants, so the legend is drawn once below the title as a pure colour key
+    (per-row counts would differ and are dropped). Only modes with a saved clip get a
+    row, so the video adapts to however many variants were trained. Clips are
+    memory-mapped; frames stream to the encoder.
     Returns (path_written_or_None, num_frames).
     """
     import os
     import glob
-
-    grid_order = list(mask_modes)[:4]
-    while len(grid_order) < 4:
-        grid_order.append(None)
+    import json
 
     # auto-discover mod labels from saved clips
     if not mods:
         found = set()
-        for mm in grid_order:
-            if mm is None:
-                continue
+        for mm in mask_modes:
             for p in glob.glob(os.path.join(save_root, env_id, mm, "eval_*.npy")):
                 found.add(os.path.basename(p)[len("eval_"):-len(".npy")])
         mods = sorted(found) if found else ["default"]
-    else:
-        mods = list(mods)
-
-    def open_clip(mask_mode, mod):
-        if mask_mode is None:
-            return None
-        p = os.path.join(save_root, env_id, mask_mode, f"eval_{mod}.npy")
-        if not os.path.exists(p):
-            return None
-        return np.load(p, mmap_mode="r")  # mmap: one frame at a time, avoids loading full clip
-
     mods = sorted(mods, key=lambda m: (m != "default", m))   # "default" first
 
-    # open all clips as memmaps; track longest length
-    clips = {}
-    cell_h = None
-    seen_w = {}
-    max_len = 0
+    # one row per (mod, mask mode) that actually has a clip; the sidecar tells us how
+    # many rows of baked-in legend to cut off (0 = legacy clip, keeps its own legend)
+    rows, max_len, total_w, key_meta = [], 0, 0, None
     for mod in mods:
-        for mm in grid_order:
-            c = open_clip(mm, mod)
-            clips[(mod, mm)] = c
-            if c is not None:
-                cell_h = c.shape[1]
-                seen_w[mm] = max(seen_w.get(mm, 0), c.shape[2])
-                max_len = max(max_len, c.shape[0])
-    if cell_h is None:
+        for mm in mask_modes:
+            p = os.path.join(save_root, env_id, mm, f"eval_{mod}.npy")
+            if not os.path.exists(p):
+                continue
+            side = p[: -len(".npy")] + ".json"
+            meta = {}
+            if os.path.exists(side):
+                with open(side) as f:
+                    meta = json.load(f)
+            c = np.load(p, mmap_mode="r")  # mmap: one frame at a time, never the full clip
+            rows.append((mod, mm, c, int(meta.get("legend_h", 0))))
+            max_len = max(max_len, c.shape[0])
+            total_w = max(total_w, c.shape[2])
+            if key_meta is None and meta.get("groups"):
+                key_meta = meta
+    if not rows:
+        print(f"[warn] no eval clips under {os.path.join(save_root, env_id)}")
         return None, None
-    fallback_w = max(seen_w.values())
-    col_w = {mm: seen_w.get(mm, fallback_w) for mm in grid_order}
-    flat = [w for mm, w in col_w.items() if mm != "planes"]
-    base_w = (min(flat) // 2) if flat else (col_w.get("planes", fallback_w) // 3)
+
+    row_gap = 6  # black separator between rows
+    labels = {(mod, mm): _strip(total_w, HEAD_H, f"{mm}  -  {mod}")
+              for mod, mm, _, _ in rows}
+    title = _strip(total_w, TITLE_H, f"{env_id}  -  OCCAM mask comparison", font_size=16)
+    if key_meta:
+        legend = _legend_strip(total_w, [(n, None, tuple(key_meta["colors"][i]))
+                                         for i, n in enumerate(key_meta["groups"])])
+    else:
+        legend = np.zeros((0, total_w, 3), np.uint8)
+    gap = np.zeros((row_gap, total_w, 3), np.uint8)
 
     # stride if max_frames set
     if max_frames and max_len > max_frames:
@@ -777,73 +922,15 @@ def build_occam_summary_video(
         out_idx = np.arange(max_len, dtype=np.int64)
     T = len(out_idx)
 
-    BG = (255, 255, 255)
-    FG = (0, 0, 0)
-    bw = 4        # cell border width
-    col_gap = 26  # horizontal gap between cells
-    row_gap = 18  # vertical gap between rows
-
-    # pre-render static banners
-    cap_h, title_h = 24, 34
-    cell_banner = {
-        (mod, mm): _text_banner(
-            col_w[mm],
-            f"{(mm or '-').upper()}  -  {mod}" + ("   (n/a)" if clips[(mod, mm)] is None else ""),
-            cap_h, font_size=16, bg=BG, fg=FG,
-        )
-        for mod in mods for mm in grid_order
-    }
-    eff_h = cell_h - strip_top_px
-    black_cell = {mm: np.zeros((eff_h, col_w[mm], 3), np.uint8) for mm in grid_order}
-    row_w = sum(col_w[mm] for mm in grid_order) + col_gap * 3
-    title = _text_banner(row_w,
-                         f"{env_id}  -  OCCAM mask comparison", title_h, font_size=24, bg=BG, fg=FG)
-
-    full_cell_h = cap_h + eff_h
-    h_spacer = np.full((full_cell_h, col_gap, 3), 255, np.uint8)
-    v_spacer = np.full((row_gap, row_w, 3), 255, np.uint8)
-
-    def _decorate(frame, mm=None):
-        """White border + panel divider lines."""
-        f = np.array(frame, dtype=np.uint8)
-        h, w = f.shape[:2]
-        for mid in ([base_w, 2 * base_w] if mm == "planes" else [w // 2]):
-            if 0 < mid < w:
-                f[:, max(0, mid - bw // 2):mid + (bw - bw // 2)] = 255
-        f[:bw, :] = 255
-        f[-bw:, :] = 255
-        f[:, :bw] = 255
-        f[:, -bw:] = 255
-        return f
-
     def grid_frame(t_src):
-        row_imgs = []
-        for mod in mods:
-            cells = []
-            for mm in grid_order:
-                c = clips[(mod, mm)]
-                if c is None:
-                    frame = black_cell[mm]
-                else:
-                    frame = np.asarray(c[min(t_src, c.shape[0] - 1)])[strip_top_px:]
-                    if frame.shape[1] != col_w[mm]:
-                        pad = max(0, col_w[mm] - frame.shape[1])
-                        frame = np.pad(frame, [(0, 0), (0, pad), (0, 0)])[:, :col_w[mm]]
-                cell = np.concatenate([cell_banner[(mod, mm)], _decorate(frame, mm)], axis=0)
-                cells.append(cell)
-            row_parts = []
-            for i, cell in enumerate(cells):
-                if i:
-                    row_parts.append(h_spacer)
-                row_parts.append(cell)
-            row_imgs.append(np.concatenate(row_parts, axis=1))
-        grid_parts = []
-        for i, ri in enumerate(row_imgs):
-            if i:
-                grid_parts.append(v_spacer)
-            grid_parts.append(ri)
-        grid = np.concatenate(grid_parts, axis=0)
-        return np.concatenate([title, grid], axis=0)
+        blocks = [title, legend]
+        for mod, mm, c, legend_h in rows:
+            frame = np.asarray(c[min(t_src, c.shape[0] - 1)])[legend_h + strip_top_px:]
+            if frame.shape[1] < total_w:
+                frame = np.pad(frame, [(0, 0), (0, total_w - frame.shape[1]), (0, 0)])
+            blocks += [labels[(mod, mm)], frame[:, :total_w], gap]
+        g = np.concatenate(blocks, axis=0)
+        return np.pad(g, [(0, g.shape[0] % 2), (0, g.shape[1] % 2), (0, 0)])
 
     # stream frames to encoder; hold last frame for hold_last_seconds
     out_name = out_name or f"summary_{env_id}.mp4"
@@ -853,24 +940,21 @@ def build_occam_summary_video(
 
     written = None
     try:
-        import imageio
-        try:
-            writer = imageio.get_writer(out_path, fps=fps, macro_block_size=None)
-            target = out_path
-        except Exception:
-            target = os.path.splitext(out_path)[0] + ".gif"
-            writer = imageio.get_writer(target, duration=1.0 / fps)
-        last = None
-        for t in out_idx:
-            last = grid_frame(int(t))
-            writer.append_data(last)
-        for _ in range(hold_n):
-            if last is not None:
-                writer.append_data(last)
-        writer.close()
+        import imageio.v3 as iio
+        target = out_path
+        with iio.imopen(target, "w", plugin="pyav") as f:
+            f.init_video_stream("libx264", fps=fps)
+            last = None
+            for t in out_idx:
+                last = grid_frame(int(t))
+                f.write_frame(np.ascontiguousarray(last, dtype=np.uint8))
+            for _ in range(hold_n):
+                if last is not None:
+                    f.write_frame(np.ascontiguousarray(last, dtype=np.uint8))
         written = target
         T += hold_n
-    except Exception:
+    except Exception as e:
+        print(f"[warn] summary encode failed: {e}")
         written = None
 
     # upload as own W&B run for persistence across re-runs

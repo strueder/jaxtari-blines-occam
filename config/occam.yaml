@@ -29,7 +29,7 @@ HF_ENTITY: ""
 # ----- environment -----
 ENV_ID: pong                  # tested: pong, breakout, freeway, seaquest, ... (TIER 1/2)
 TRAIN_MODS: []
-EVAL_MODS: ["lazy_enemy"]     # pong-specific; adjust/empty for other games
+EVAL_MODS: []     # pong-specific; adjust/empty for other games
 EVAL_DURING_TRAIN: True
 EVAL_EVERY: 50                # in ALG iterations; metrics are computed at every eval
 VIDEO_EVERY: 1000            # in ALG iterations; a comparison video is rendered only
