@@ -17,12 +17,18 @@ THE FOUR OCCAM ABSTRACTION LEVELS (all implemented here, selected via
 `mask_mode`); see Sec. 2.2 / Figure 3 of the paper:
     - "object" : keep the real (grayscale) pixels inside each object box,
                  zero out the background.                       -> (F, 84, 84)
-    - "binary" : 1 inside any object box, 0 elsewhere (no identity / texture).
+    - "binary" : 255 inside any object box, 0 elsewhere (no identity / texture).
                                                                 -> (F, 84, 84)
     - "class"  : each object box filled with a class-specific gray level
                  (category preserved, texture discarded).       -> (F, 84, 84)
-    - "planes" : one binary plane per object category, stacked as channels.
+    - "planes" : one plane per object category, stacked as channels.
                                                           -> (F * n_classes, 84, 84)
+
+    All four are drawn at native 210x160 and area-downscaled to 84x84 afterwards, so
+    "binary" and "planes" are NOT two-valued in the output: pixels on an object edge
+    are only partially covered and carry the intermediate gray. Anything downstream
+    that tests `== 255` or `astype(bool)` on a mask is wrong; test `> 0` for occupancy
+    and treat the value as coverage.
 
 The "class" of an object is its group in the game's observation PyTree
 (e.g. Pong -> {player, enemy, ball}; Skiing -> {skier, flags, trees, moguls}).
@@ -35,6 +41,13 @@ per group are *static* for a given game, so the whole pipeline is traced once
 and stays JIT/vmap-compatible. The frame-stack and (for Planes) the per-class
 planes are folded into the channel axis so the existing CNN in jaxtari-blines
 (`agents/ppo/ppo.py::Network`) consumes the output unchanged.
+
+CHECKPOINT COMPATIBILITY: checkpoints trained before the switch to exact area
+downscaling are NOT comparable to ones trained after it. The observation
+distribution changed in two ways: "binary"/"planes" went from two-valued 0/255 to
+continuous coverage values, and the "class" palette moved from 90/172/255 to
+85/170/255 (K=3). Shapes are unchanged, so an old checkpoint still loads and runs -
+it just sees inputs it was never trained on. Retrain rather than fine-tune.
 """
 
 from __future__ import annotations
@@ -64,18 +77,38 @@ def _rgb_to_gray(frame_rgb: jnp.ndarray) -> jnp.ndarray:
     return jnp.dot(frame_rgb.astype(jnp.float32), _GRAY_W)
 
 
-def _resize(img: jnp.ndarray, out_hw: Tuple[int, int], method: str) -> jnp.ndarray:
-    """Resize the last two spatial axes of `img` to `out_hw`."""
-    target = tuple(img.shape[:-2]) + tuple(out_hw)
-    return jax.image.resize(img.astype(jnp.float32), target, method=method)
+def _area_weights(src: int, dst: int) -> np.ndarray:
+    """(dst, src) area-resampling weights, identical to cv2.INTER_AREA on downscale.
+
+    Destination pixel i covers the source interval [i*s, (i+1)*s) with s = src/dst;
+    weight[i, j] is the length of that interval's overlap with source pixel [j, j+1),
+    normalized by s. Rows sum to 1, so the operator is an exact box average.
+
+    Downscale only: on upscale cv2.INTER_AREA degenerates to INTER_NEAREST and this
+    formula no longer describes it.
+    """
+    assert src >= dst, f"_area_weights is downscale-only, got src={src} < dst={dst}"
+    s = src / dst
+    edges = np.arange(dst + 1, dtype=np.float64) * s
+    lo = np.arange(src, dtype=np.float64)[None, :]
+    overlap = np.minimum(lo + 1.0, edges[1:, None]) - np.maximum(lo, edges[:-1, None])
+    return np.clip(overlap, 0.0, None) / s
+
+
+def _area_resize(img: jnp.ndarray, w_y: jnp.ndarray, w_x: jnp.ndarray) -> jnp.ndarray:
+    """Area-downscale the last two axes of `img` via `w_y @ img @ w_x`."""
+    return jnp.matmul(jnp.matmul(w_y, img.astype(jnp.float32)), w_x)
 
 
 def _make_gray_palette(n_classes: int) -> np.ndarray:
-    """(n_classes + 1,) uint8. Index 0 = background (0), rest are distinct grays."""
-    if n_classes <= 1:
-        levels = [255]
-    else:
-        levels = list(np.linspace(90, 255, n_classes).round().astype(int))
+    """(n_classes + 1,) uint8. Index 0 = background (0), rest are distinct grays.
+
+    Same ladder as the reference ObjectTypeMaskWrapper: shade = 255 // K, class i
+    gets (i + 1) * shade, so the brightest class is at most 255 and the spacing is
+    uniform and independent of K.
+    """
+    shade = 255 // max(n_classes, 1)
+    levels = [(i + 1) * shade for i in range(max(n_classes, 1))]
     return np.array([0] + levels, dtype=np.uint8)
 
 
@@ -89,12 +122,117 @@ def _make_color_palette(n_classes: int) -> np.ndarray:
     return np.array(cols, dtype=np.uint8)
 
 
+def _planes_isometric_rgb(
+    planes: jnp.ndarray,
+    palette: jnp.ndarray,
+    out_h: int,
+    out_w: int,
+    shear: float = 0.25,
+    gap_frac: float = 0.38,
+    rise_frac: float = 0.05,
+    bg_alpha: float = 0.20,
+    aspect: float | None = None,
+) -> jnp.ndarray:
+    """Render (K, h, w) binary planes as obliquely stacked translucent sheets.
+
+    Visualization only -- this never touches the observation. Each plane becomes a
+    sheared parallelogram, offset right and up from the one behind it, tinted with
+    its class colour. Mirrors Figure 3(e) of the OCCAM paper, where "Planes" is
+    drawn as a stack of sheets rather than one flattened image.
+
+    `aspect` is the width/height ratio each sheet is drawn at, independent of the
+    source shape. Pass the native frame ratio to undo the square 84x84 squash, so
+    the sheets match the other mask panels; defaults to the source ratio.
+
+    Everything is a closed-form inverse map plus a gather, so it stays jit- and
+    vmap-compatible: K is static, and no plane is materialised at full canvas size.
+    """
+    K, h, w = planes.shape
+    A = (w / h) if aspect is None else float(aspect)
+
+    # fit the stack into the canvas: solve for the sheet height, width follows A
+    ph_from_w = out_w / (A * (1.0 + (K - 1) * gap_frac))
+    ph_from_h = out_h / (1.0 + (K - 1) * rise_frac + shear * A)
+    ph = 0.94 * min(ph_from_w, ph_from_h)
+    pw = A * ph
+    sx, sy = pw / w, ph / h        # independent axis scales -> free aspect change
+    dx = gap_frac * pw             # per-plane shift right
+    dy = -rise_frac * ph           # per-plane shift up (negative y)
+
+    need_w = pw + (K - 1) * dx
+    need_h = ph + shear * pw - (K - 1) * dy
+    ox = (out_w - need_w) / 2.0
+    oy = -(K - 1) * dy + (out_h - need_h) / 2.0
+
+    X = jnp.arange(out_w, dtype=jnp.float32)[None, :]
+    Y = jnp.arange(out_h, dtype=jnp.float32)[:, None]
+
+    canvas = jnp.zeros((out_h, out_w, 3), jnp.float32)
+    for k in range(K - 1, -1, -1):                     # painter's order: back to front
+        xr = X - ox - k * dx
+        u = xr / sx
+        v = (Y - oy - k * dy - shear * xr) / sy
+        inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        ui = jnp.clip(u, 0, w - 1).astype(jnp.int32)
+        vi = jnp.clip(v, 0, h - 1).astype(jnp.int32)
+
+        hit = (planes[k][vi, ui] > 0) & inside
+        # thresholds in source units, chosen so the frame is ~1.5 output px on both
+        # axes even when sx != sy
+        eu, ev = 1.5 / sx, 1.5 / sy
+        edge = inside & ((u < eu) | (u > w - 1 - eu) | (v < ev) | (v > h - 1 - ev))
+
+        # sheet frame carries the class colour too, so each pane is identifiable
+        # even when it holds no active object
+        cls = palette[k + 1].astype(jnp.float32)
+        col = jnp.where((hit | edge)[..., None], cls, jnp.float32(18.0))
+        alpha = jnp.where(hit, 1.0, jnp.where(edge, 0.75, jnp.where(inside, bg_alpha, 0.0)))
+        canvas = canvas * (1.0 - alpha[..., None]) + col * alpha[..., None]
+
+    return jnp.clip(canvas, 0.0, 255.0).astype(jnp.uint8)
+
+
 def _extract_object_groups(obs: Any) -> List[ObjectObservation]:
     """ObjectObservation leaves from obs PyTree, in deterministic PyTree order."""
     leaves = jax.tree_util.tree_leaves(
         obs, is_leaf=lambda n: isinstance(n, ObjectObservation)
     )
     return [leaf for leaf in leaves if isinstance(leaf, ObjectObservation)]
+
+
+def _group_names(obs: Any) -> List[str]:
+    """Names of the ObjectObservation leaves, in the same order as _extract_object_groups."""
+    paths, _ = jax.tree_util.tree_flatten_with_path(
+        obs, is_leaf=lambda n: isinstance(n, ObjectObservation)
+    )
+    names = []
+    for path, leaf in paths:
+        if isinstance(leaf, ObjectObservation):
+            names.append(".".join(
+                str(getattr(k, "name", getattr(k, "key", k))) for k in path
+            ))
+    return names
+
+
+def _render_order(base_env: Any, names: List[str]) -> List[int]:
+    """Back-to-front group indices. Reads OCCAM_RENDER_ORDER off the game if declared.
+
+    A game may expose OCCAM_RENDER_ORDER as a tuple of group names in the order its
+    own render() draws them. Without it the PyTree field order is used, which is not
+    the draw order in general.
+    """
+    declared = getattr(base_env, "OCCAM_RENDER_ORDER", None)
+    if not declared:
+        return list(range(len(names)))
+    pos = {n: i for i, n in enumerate(names)}
+    order = [pos[n] for n in declared if n in pos]
+    seen = set(order)
+    return order + [i for i in range(len(names)) if i not in seen]
+
+
+def _sheets_width(base_w: int, k: int, gap_frac: float = 0.38) -> int:
+    """Panel width the isometric sheet stack needs for k planes."""
+    return int(round(base_w * (1.0 + gap_frac * max(0, k - 1))))
 
 
 def _group_box_arrays(group: ObjectObservation, img_h: int, img_w: int):
@@ -120,18 +258,27 @@ def _group_box_arrays(group: ObjectObservation, img_h: int, img_w: int):
 
 
 def _rasterize_group(x, y, w, h, valid, img_h: int, img_w: int) -> jnp.ndarray:
-    """Boolean occupancy mask (img_h, img_w): True wherever any valid box covers the pixel."""
-    n = x.shape[0]
-    ox = x.reshape(n, 1, 1)
-    oy = y.reshape(n, 1, 1)
-    ow = w.reshape(n, 1, 1)
-    oh = h.reshape(n, 1, 1)
-    col = jnp.arange(img_w).reshape(1, 1, img_w)
-    row = jnp.arange(img_h).reshape(1, img_h, 1)
+    """Boolean occupancy mask (img_h, img_w): True wherever any valid box covers the pixel.
 
-    inside = (col >= ox) & (col < ox + ow) & (row >= oy) & (row < oy + oh)
-    inside = inside & valid.reshape(n, 1, 1)
-    return inside.any(axis=0)  # (H, W) bool
+    Stamps each box as +/-1 corners into a difference array and integrates with two
+    cumsums, so cost is O(n + img_h * img_w) instead of the O(n * img_h * img_w) of an
+    n-wide broadcast. Matters for grid games (Breakout bricks, MsPacman pills) where a
+    single group holds hundreds of boxes.
+    """
+    x0 = jnp.clip(x, 0, img_w)
+    x1 = jnp.clip(x + w, 0, img_w)
+    y0 = jnp.clip(y, 0, img_h)
+    y1 = jnp.clip(y + h, 0, img_h)
+    inc = valid.astype(jnp.int32)
+
+    diff = jnp.zeros((img_h + 1, img_w + 1), dtype=jnp.int32)
+    diff = diff.at[y0, x0].add(inc)
+    diff = diff.at[y0, x1].add(-inc)
+    diff = diff.at[y1, x0].add(-inc)
+    diff = diff.at[y1, x1].add(inc)
+
+    counts = jnp.cumsum(jnp.cumsum(diff, axis=0), axis=1)
+    return counts[:img_h, :img_w] > 0  # (H, W) bool
 
 
 def _union(group_masks: List[jnp.ndarray]) -> jnp.ndarray:
@@ -140,6 +287,28 @@ def _union(group_masks: List[jnp.ndarray]) -> jnp.ndarray:
     for gm in group_masks[1:]:
         union = union | gm
     return union
+
+
+def _group_masks(obs: Any, img_h: int, img_w: int) -> List[jnp.ndarray]:
+    """One (H, W) boolean occupancy mask per ObjectObservation group."""
+    return [
+        _rasterize_group(*_group_box_arrays(g, img_h, img_w), img_h, img_w)
+        for g in _extract_object_groups(obs)
+    ]
+
+
+def _class_map(group_masks: List[jnp.ndarray], order: List[int] | None = None) -> jnp.ndarray:
+    """(H, W) int32 class ids, 1..K with 0 = background.
+
+    Painted back to front, so a later group in `order` overwrites an earlier one.
+    Without `order` the PyTree field order is used, matching the reference's
+    sequential `state[...].fill(value)` loop.
+    """
+    idx = range(len(group_masks)) if order is None else order
+    class_map = jnp.zeros(group_masks[0].shape, dtype=jnp.int32)
+    for k in idx:
+        class_map = jnp.where(group_masks[k], k + 1, class_map)
+    return class_map
 
 
 @struct.dataclass
@@ -153,6 +322,22 @@ class OCCAMWrapper(JaxatariWrapper):
     """
     Object-Centric Attention via Masking wrapper. Apply after AtariWrapper, in place of PixelObsWrapper.
     Output shape: (frame_stack_size, 84, 84, 1) for object/binary/class; (frame_stack_size * n_classes, 84, 84, 1) for planes.
+
+    Frame-skip, max-pooling, stacking and reward clipping live here because
+    AtariWrapper deliberately leaves them to the observation wrapper (one emulator
+    frame per AtariWrapper.step), so this mirrors PixelObsWrapper exactly.
+
+    `max_pooling` is a deliberate deviation from the reference, which has none. It is
+    kept for parity with PixelObsWrapper and only affects `mask_mode="object"`: the
+    other three modes are drawn from object coordinates, never from pixels, so the
+    max-pooled frame never reaches them.
+
+    REWARD ACROSS TERMINATION: AtariWrapper has no autoreset, so the frame-skip scan
+    runs its full `frame_skip` sub-steps even when the first one already terminated,
+    and `jnp.sum(rewards)` therefore includes rewards emitted after termination. This
+    is intentional parity, not an oversight: PixelObsWrapper and ObjectCentricWrapper
+    reduce identically (fixed-length scan, `sum(rewards)`, `terminations.any()`), so
+    changing it here alone would make OCCAM runs incomparable to the pixel baseline.
     """
 
     def __init__(
@@ -195,6 +380,10 @@ class OCCAMWrapper(JaxatariWrapper):
         self._gray_palette = jnp.asarray(_make_gray_palette(self.num_classes))   # (K+1,)
         self._color_palette = jnp.asarray(_make_color_palette(self.num_classes)) # (K+1, 3)
 
+        # static area-resampling operators: (out_h, img_h) and (img_w, out_w)
+        self._w_y = jnp.asarray(_area_weights(self.img_h, self.out_h), dtype=jnp.float32)
+        self._w_x = jnp.asarray(_area_weights(self.img_w, self.out_w).T, dtype=jnp.float32)
+
         self.per_frame_channels = self.num_classes if mask_mode == "planes" else 1
         total_channels = self.frame_stack_size * self.per_frame_channels
         self._observation_space = spaces.Box(
@@ -206,47 +395,32 @@ class OCCAMWrapper(JaxatariWrapper):
 
     def _mask_single(self, frame_rgb: jnp.ndarray, obs: Any) -> jnp.ndarray:
         """Build the OCCAM mask for one native-resolution frame. Returns (C, out_h, out_w) uint8."""
-        groups = _extract_object_groups(obs)
-        group_masks = []  # (H, W) bool per group
-        for g in groups:
-            x, y, w, h, valid = _group_box_arrays(g, self.img_h, self.img_w)
-            group_masks.append(_rasterize_group(x, y, w, h, valid, self.img_h, self.img_w))
+        group_masks = _group_masks(obs, self.img_h, self.img_w)
 
-        oh, ow = self.out_h, self.out_w
-
+        # The reference draws every mask at native 210x160 and then area-downscales
+        # once, with no thresholding, so partially covered output pixels keep their
+        # continuous gray value. Downscale last, never threshold after.
         if self.mask_mode == "object":
-            # real pixels inside boxes, zero background, bilinear-resize like PixelObsWrapper
-            gray = _rgb_to_gray(frame_rgb)                              # (H, W) float
+            # real grayscale pixels inside boxes, zero background. Round first: the
+            # reference reads an already-quantized uint8 screen from the emulator.
+            gray = jnp.round(_rgb_to_gray(frame_rgb))                   # (H, W) float
             union = _union(group_masks)
-            masked = jnp.where(union, gray, 0.0)[None]                 # (1, H, W)
-            out = _resize(masked, (oh, ow), "bilinear")
+            native = jnp.where(union, gray, 0.0)[None]                  # (1, H, W)
 
         elif self.mask_mode == "binary":
-            # linear downsample + threshold so sub-pixel objects survive 160->84
-            union = _union(group_masks).astype(jnp.float32)[None]      # (1, H, W)
-            out = (_resize(union, (oh, ow), "linear") > 0.0).astype(jnp.float32) * 255.0
+            native = _union(group_masks).astype(jnp.float32)[None] * 255.0
 
         elif self.mask_mode == "class":
-            # argmax over per-class coverage; tiny bias breaks ties toward later groups
-            cov = jnp.stack(
-                [_resize(gm.astype(jnp.float32)[None], (oh, ow), "linear")[0] for gm in group_masks],
-                axis=0,
-            )                                                           # (K, oh, ow)
-            bias = (jnp.arange(self.num_classes, dtype=jnp.float32).reshape(-1, 1, 1) + 1.0) * 1e-3
-            scored = jnp.where(cov > 0.0, cov + bias, 0.0)
-            any_cov = (cov > 0.0).any(axis=0)                           # (oh, ow)
-            cls = jnp.argmax(scored, axis=0) + 1                        # 1..K
-            class_map = jnp.where(any_cov, cls, 0)                      # 0 == background
-            out = self._gray_palette[class_map].astype(jnp.float32)[None]
+            # class gray levels painted natively, later group wins on overlap
+            native = self._gray_palette[_class_map(group_masks)].astype(jnp.float32)[None]
 
-        else:  # "planes": one binary plane per class
-            planes = jnp.stack(
-                [_resize(gm.astype(jnp.float32)[None], (oh, ow), "linear")[0] for gm in group_masks],
-                axis=0,
-            )                                                           # (K, oh, ow)
-            out = (planes > 0.0).astype(jnp.float32) * 255.0
+        else:  # "planes": one plane per class
+            native = jnp.stack([gm.astype(jnp.float32) for gm in group_masks], axis=0) * 255.0
 
-        return jnp.clip(out, 0.0, 255.0).astype(jnp.uint8)
+        out = _area_resize(native, self._w_y, self._w_x)                # (C, oh, ow)
+        # round, don't truncate: cv2.resize rounds when it writes uint8, so a bare
+        # cast would bias every partially covered pixel down by up to 1.
+        return jnp.clip(jnp.round(out), 0.0, 255.0).astype(jnp.uint8)
 
     def _stack_to_obs(self, mask_stack: jnp.ndarray) -> jnp.ndarray:
         """(F, C, H, W) -> (F*C, H, W, 1) uint8."""
@@ -254,7 +428,11 @@ class OCCAMWrapper(JaxatariWrapper):
         return mask_stack.reshape(f * c, h, w)[..., None]
 
     def _reset_internal(self, key):
-        _, atari_state = self._env.reset(key)
+        # AtariWrapper.step already advances state.key on every sub-step, so the key
+        # handed in on autoreset is never a literal repeat. Split anyway so the seed
+        # consumed by reset is provably distinct from the key living in the state.
+        reset_key, _ = jax.random.split(key)
+        _, atari_state = self._env.reset(reset_key)
         frame = self.base_env.render(atari_state.env_state)
         obs = self.base_env._get_observation(atari_state.env_state)
         m = self._mask_single(frame, obs)                              # (C, H, W)
@@ -327,24 +505,41 @@ class OCCAMWrapper(JaxatariWrapper):
 class _OCCAMViz:
     """Side-by-side [game | OCCAM mask] video helper; used only for eval logging."""
 
-    def __init__(self, base_env, mask_mode: str):
+    def __init__(self, base_env, mask_mode: str, obs_res: bool = False,
+                 out_size: Tuple[int, int] = (84, 84)):
         self.env = base_env
         self.mask_mode = mask_mode
+        self.obs_res = bool(obs_res)
         img_shape = base_env.image_space().shape
         self.img_h, self.img_w = int(img_shape[0]), int(img_shape[1])
+        self.out_h, self.out_w = int(out_size[0]), int(out_size[1])
 
         probe = base_env._get_observation(base_env.reset(jax.random.PRNGKey(0))[1])
         self.num_classes = len(_extract_object_groups(probe))
+        self.render_order = _render_order(base_env, _group_names(probe))
         self._gray_palette = jnp.asarray(_make_gray_palette(self.num_classes))
         self._color_palette = jnp.asarray(_make_color_palette(self.num_classes))
+        self._w_y = jnp.asarray(_area_weights(self.img_h, self.out_h), dtype=jnp.float32)
+        self._w_x = jnp.asarray(_area_weights(self.img_w, self.out_w).T, dtype=jnp.float32)
+
+    def _to_obs_res(self, rgb: jnp.ndarray) -> jnp.ndarray:
+        """(H, W, 3) uint8 -> (out_h, out_w, 3) uint8, same area operator as the wrapper."""
+        chw = jnp.transpose(rgb.astype(jnp.float32), (2, 0, 1))
+        out = _area_resize(chw, self._w_y, self._w_x)
+        out = jnp.clip(jnp.round(out), 0.0, 255.0).astype(jnp.uint8)
+        return jnp.transpose(out, (1, 2, 0))
+
+    def planes_rgb(self, obs: Any) -> jnp.ndarray:
+        """(K, h, w) boolean planes at the active resolution, for the sheet stack."""
+        masks = jnp.stack(_group_masks(obs, self.img_h, self.img_w))
+        if not self.obs_res:
+            return masks
+        f = _area_resize(masks.astype(jnp.float32), self._w_y, self._w_x)
+        return f > 0.0
 
     def _mask_rgb(self, frame_rgb: jnp.ndarray, obs: Any) -> jnp.ndarray:
         """Native-resolution RGB visualization (H, W, 3) uint8 of the mask."""
-        groups = _extract_object_groups(obs)
-        group_masks = [
-            _rasterize_group(*_group_box_arrays(g, self.img_h, self.img_w), self.img_h, self.img_w)
-            for g in groups
-        ]
+        group_masks = _group_masks(obs, self.img_h, self.img_w)
         if self.mask_mode == "binary":
             union = _union(group_masks)
             rgb = jnp.where(union[..., None], jnp.uint8(255), jnp.uint8(0))
@@ -356,32 +551,43 @@ class _OCCAMViz:
             masked = jnp.where(union, gray, 0.0).astype(jnp.uint8)
             rgb = jnp.repeat(masked[..., None], 3, axis=-1)
 
-        else:  # class / planes -> color-code categories
-            class_map = jnp.zeros((self.img_h, self.img_w), dtype=jnp.int32)
-            for k, gm in enumerate(group_masks):
-                class_map = jnp.where(gm, k + 1, class_map)
-            rgb = self._color_palette[class_map]
+        elif self.mask_mode == "class":
+            # same single-label rule as _mask_single: later group wins on overlap
+            rgb = self._color_palette[_class_map(group_masks)]
 
-        return rgb.astype(jnp.uint8)
+        else:
+            rgb = self._color_palette[_class_map(group_masks, self.render_order)]
+
+        rgb = rgb.astype(jnp.uint8)
+        return self._to_obs_res(rgb) if self.obs_res else rgb
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _frame(self, env_state) -> jnp.ndarray:
-        clean = self.env.render(env_state).astype(jnp.uint8)          # (H, W, 3)
+        clean = self.env.render(env_state).astype(jnp.uint8)
         obs = self.env._get_observation(env_state)
-        mask_rgb = self._mask_rgb(clean, obs)                          # (H, W, 3)
-        return jnp.concatenate([clean, mask_rgb], axis=1)             # (H, 2W, 3)
+        mask_rgb = self._mask_rgb(clean, obs)
+        panel = self._to_obs_res(clean) if self.obs_res else clean
+        if self.mask_mode != "planes":
+            return jnp.concatenate([panel, mask_rgb], axis=1)
+        h, w = panel.shape[0], panel.shape[1]
+        sheets = _planes_isometric_rgb(
+            self.planes_rgb(obs), self._color_palette,
+            h, _sheets_width(w, self.num_classes), aspect=w / h,
+        )
+        return jnp.concatenate([panel, mask_rgb, sheets], axis=1)
 
     def frames(self, env_states) -> jnp.ndarray:
-        """(T, ...) base env states -> (T, H, 2W, 3) uint8."""
+        """(T, ...) base env states -> (T, H, W_row, 3) uint8; 3 panels in planes mode."""
         return jax.vmap(self._frame)(env_states)
 
 
-def occam_comparison_frames(env_id: str, mask_mode: str, env_states, mods=None):
+def occam_comparison_frames(env_id: str, mask_mode: str, env_states, mods=None,
+                            obs_res: bool = False):
     """Side-by-side [game | mask] frames (T, H, 2W, 3) uint8 for one eval rollout."""
     import jaxatari  # local import to avoid a hard dependency at module import time
 
     base_env = jaxatari.make(env_id, mods=mods)
-    viz = _OCCAMViz(base_env, mask_mode)
+    viz = _OCCAMViz(base_env, mask_mode, obs_res=obs_res)
     return np.asarray(viz.frames(env_states), dtype=np.uint8)         # (T, H, 2W, 3)
 
 
@@ -479,9 +685,11 @@ def log_occam_comparison_video(
     save_dir: str | None = None,
     wandb_run=None,
     log_wandb: bool = True,
+    obs_res: bool = False,
 ):
     """Render, optionally save (.npy), caption and W&B-log a [game | mask] eval clip."""
-    frames = occam_comparison_frames(env_id, mask_mode, env_states, mods=mods)   # (T,H,2W,3) RAW
+    frames = occam_comparison_frames(env_id, mask_mode, env_states, mods=mods,
+                                     obs_res=obs_res)
     if save_dir is not None:
         save_eval_frames(save_dir, mod_label, frames, fps=fps)
     captioned = _caption_clip(frames, f"{env_id} | {mask_mode} | {mod_label} | step {step}")
@@ -544,17 +752,23 @@ def build_occam_summary_video(
 
     # open all clips as memmaps; track longest length
     clips = {}
-    cell_h = cell_w = None
+    cell_h = None
+    seen_w = {}
     max_len = 0
     for mod in mods:
         for mm in grid_order:
             c = open_clip(mm, mod)
             clips[(mod, mm)] = c
             if c is not None:
-                cell_h, cell_w = c.shape[1], c.shape[2]
+                cell_h = c.shape[1]
+                seen_w[mm] = max(seen_w.get(mm, 0), c.shape[2])
                 max_len = max(max_len, c.shape[0])
     if cell_h is None:
         return None, None
+    fallback_w = max(seen_w.values())
+    col_w = {mm: seen_w.get(mm, fallback_w) for mm in grid_order}
+    flat = [w for mm, w in col_w.items() if mm != "planes"]
+    base_w = (min(flat) // 2) if flat else (col_w.get("planes", fallback_w) // 3)
 
     # stride if max_frames set
     if max_frames and max_len > max_frames:
@@ -573,28 +787,29 @@ def build_occam_summary_video(
     cap_h, title_h = 24, 34
     cell_banner = {
         (mod, mm): _text_banner(
-            cell_w,
+            col_w[mm],
             f"{(mm or '-').upper()}  -  {mod}" + ("   (n/a)" if clips[(mod, mm)] is None else ""),
             cap_h, font_size=16, bg=BG, fg=FG,
         )
         for mod in mods for mm in grid_order
     }
     eff_h = cell_h - strip_top_px
-    black_cell = np.zeros((eff_h, cell_w, 3), np.uint8)
-    title = _text_banner(cell_w * 4 + col_gap * 3,
+    black_cell = {mm: np.zeros((eff_h, col_w[mm], 3), np.uint8) for mm in grid_order}
+    row_w = sum(col_w[mm] for mm in grid_order) + col_gap * 3
+    title = _text_banner(row_w,
                          f"{env_id}  -  OCCAM mask comparison", title_h, font_size=24, bg=BG, fg=FG)
 
     full_cell_h = cap_h + eff_h
     h_spacer = np.full((full_cell_h, col_gap, 3), 255, np.uint8)
-    row_w = cell_w * 4 + col_gap * 3
     v_spacer = np.full((row_gap, row_w, 3), 255, np.uint8)
 
-    def _decorate(frame):
-        """White border + game|mask divider line."""
+    def _decorate(frame, mm=None):
+        """White border + panel divider lines."""
         f = np.array(frame, dtype=np.uint8)
         h, w = f.shape[:2]
-        mid = w // 2
-        f[:, max(0, mid - bw // 2):mid + (bw - bw // 2)] = 255
+        for mid in ([base_w, 2 * base_w] if mm == "planes" else [w // 2]):
+            if 0 < mid < w:
+                f[:, max(0, mid - bw // 2):mid + (bw - bw // 2)] = 255
         f[:bw, :] = 255
         f[-bw:, :] = 255
         f[:, :bw] = 255
@@ -608,10 +823,13 @@ def build_occam_summary_video(
             for mm in grid_order:
                 c = clips[(mod, mm)]
                 if c is None:
-                    frame = black_cell
+                    frame = black_cell[mm]
                 else:
                     frame = np.asarray(c[min(t_src, c.shape[0] - 1)])[strip_top_px:]
-                cell = np.concatenate([cell_banner[(mod, mm)], _decorate(frame)], axis=0)
+                    if frame.shape[1] != col_w[mm]:
+                        pad = max(0, col_w[mm] - frame.shape[1])
+                        frame = np.pad(frame, [(0, 0), (0, pad), (0, 0)])[:, :col_w[mm]]
+                cell = np.concatenate([cell_banner[(mod, mm)], _decorate(frame, mm)], axis=0)
                 cells.append(cell)
             row_parts = []
             for i, cell in enumerate(cells):

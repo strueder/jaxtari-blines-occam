@@ -13,3 +13,9 @@ wheels/
 models/
 outputs/
 wandb/
+
+#graphify
+/graphify-out
+/.claude
+CLAUDE.md
+.gitattributes
