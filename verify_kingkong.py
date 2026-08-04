@@ -403,7 +403,8 @@ def main():
             imageio.imwrite(os.path.join(png_dir, f"{i:02d}_{safe}.png"), row)
         print(f"[{i:02d}] {title}")
 
-    imageio.mimwrite(args.out, frames, fps=args.fps, macro_block_size=1)
+iio.imwrite(args.out, np.asarray(frames, dtype=np.uint8),
+                plugin="pyav", codec="libx264", fps=args.fps)
     print(f"\nwrote {args.out}  ({len(situations)} situations, {len(frames)} frames)")
     src = f"OCCAMWrapper._mask_single (real {OUT_H}x{OUT_W} training masks)" if args.obs_res \
           else "_OCCAMViz._mask_rgb (native res)"
