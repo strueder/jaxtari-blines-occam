@@ -11,8 +11,9 @@ dependencies = [
     "hydra-core>=1.3.2",
     "imageio>=2.37.3",
     "imageio-ffmpeg>=0.6.0",
-    "jax[cuda12]>=0.4.38",
+    "jax[cuda12]>=0.4.38", # use "jax" if no cuda available
     "av>=18.0.0",
+    "flashbax",
 ]
 
 [tool.uv]
