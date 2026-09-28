@@ -24,4 +24,6 @@ wandb/
 CLAUDE.md
 .gitattributes
 
+/recordings/
+
 /verification/*

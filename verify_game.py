@@ -37,6 +37,7 @@ from typing import Dict, List, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import av
 import imageio.v3 as iio
 from scipy import ndimage
 
@@ -53,7 +54,19 @@ from verify_kingkong import MODES, OUT_H, OUT_W, _row
 OUT_ROOT = "verification"
 
 # games that ship a hand-written scenario list; everything else is mined
-POSE_PROVIDERS = {"kingkong": ("verify_kingkong", "build_poses")}
+POSE_PROVIDERS = {
+    "kingkong": ("verify_kingkong", "build_poses"),
+    "centipede": ("verify_centipede", "build_poses"),
+    "pacman": ("verify_pacman", "build_poses"),
+    "alien": ("verify_alien", "build_poses"),
+    "venture": ("verify_venture", "build_poses"),
+    "donkeykong": ("verify_donkeykong", "build_poses"),
+    "berzerk": ("verify_berzerk", "build_poses"),
+    "enduro": ("verify_enduro", "build_poses"),
+    "phoenix": ("verify_phoenix", "build_poses"),
+    "sirlancelot": ("verify_sirlancelot", "build_poses"),
+    "montezumarevenge": ("verify_montezumarevenge", "build_poses"),
+}
 
 # a state field is treated as a "phase" (gamestate / level / mode / lives) when it
 # is a scalar integer taking at least 2 and at most this many distinct values
@@ -108,11 +121,13 @@ CATEGORIES = {
 class Report:
     """print() that also keeps every line for the Markdown report file."""
 
-    def __init__(self):
+    def __init__(self, silent: bool = False):
         self.lines: List[str] = []
+        self.silent = silent
 
     def __call__(self, s: str = ""):
-        print(s)
+        if not self.silent:
+            print(s)
         self.lines.append(s)
 
     def text(self) -> str:
@@ -702,7 +717,7 @@ def collect_classes(game: str, obs) -> dict:
 # --------------------------------------------------------------------------
 
 def run_game(args) -> int:
-    rep = Report()
+    rep = Report(silent=getattr(args, "quiet", False))
     stamp = _dt.datetime.now()
     ts = stamp.strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = os.path.join(args.out_root, args.game, f"{args.game}_{ts}")
@@ -799,9 +814,23 @@ def _write_outputs(args, run_dir, rep: Report, result: dict, video_ctx):
             if args.png:
                 safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in title)
                 iio.imwrite(os.path.join(png_dir, f"{i:02d}_{safe[:60]}.png"), row)
+        hmax = max(f.shape[0] for f in frames)
+        wmax = max(f.shape[1] for f in frames)
+        hmax += hmax % 2
+        wmax += wmax % 2
         path = os.path.join(run_dir, f"{args.game}_sweep.mp4")
-        iio.imwrite(path, np.asarray(frames, np.uint8),
-                    plugin="pyav", codec="libx264", fps=args.fps)
+        container = av.open(path, mode="w")
+        stream = container.add_stream("libx264", rate=args.fps)
+        stream.width, stream.height, stream.pix_fmt = wmax, hmax, "yuv420p"
+        canvas = np.zeros((hmax, wmax, 3), np.uint8)
+        for f in frames:
+            canvas[:] = 0
+            canvas[:f.shape[0], :f.shape[1]] = f
+            for packet in stream.encode(av.VideoFrame.from_ndarray(canvas, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
         rep("## Artifacts")
         rep()
         rep(f"- video: `{path}` ({len(scenarios)} scenarios, {len(frames)} frames)")
@@ -1030,6 +1059,8 @@ def main():
     p.add_argument("--timeout", type=int, default=1800,
                    help="per-game timeout in seconds, only for 'all'")
     p.add_argument("--out-root", default=OUT_ROOT)
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="no markdown on stdout, only write report and visuals")
     args = p.parse_args()
 
     if args.summarize:

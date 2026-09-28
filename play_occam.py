@@ -2,8 +2,10 @@ import argparse
 import contextlib
 import os
 import signal
+import subprocess
 import sys
 from datetime import datetime
+from types import SimpleNamespace
 
 
 def _parse_args(argv=None):
@@ -37,7 +39,7 @@ import jax.numpy as jnp
 import pygame
 
 import jaxatari
-from jaxatari.environment import JAXAtariAction
+from jaxatari.environment import JAXAtariAction, ObjectObservation
 from jaxatari.wrappers import AtariWrapper
 
 from agents.occam.occam import (
@@ -155,8 +157,8 @@ def _pad_width(img, width):
     return np.pad(img, ((0, 0), (0, width - img.shape[1]), (0, 0)))
 
 
-def _make_env(base, mode, args):
-    env = AtariWrapper(
+def _make_atari(base):
+    return AtariWrapper(
         base,
         sticky_actions=0.0,
         episodic_life=False,
@@ -164,8 +166,11 @@ def _make_env(base, mode, args):
         noop_max=30,
         full_action_space=False,
     )
+
+
+def _make_env(base, mode, args):
     return OCCAMWrapper(
-        env,
+        _make_atari(base),
         mask_mode=mode,
         frame_stack_size=args.frame_stack,
         frame_skip=args.frame_skip,
@@ -173,6 +178,39 @@ def _make_env(base, mode, args):
         clip_reward=False,
         game_name=args.game,
     )
+
+
+def _path_name(path):
+    return ".".join(str(getattr(k, "name", getattr(k, "key", getattr(k, "idx", k)))) for k in path)
+
+
+def _describe_obs(obs):
+    """(ObjectObservation group names, 'name (shape)' of every other leaf) in PyTree order."""
+    paths, _ = jax.tree_util.tree_flatten_with_path(obs, is_leaf=lambda n: isinstance(n, ObjectObservation))
+    groups, other = [], []
+    for path, leaf in paths:
+        name = _path_name(path) or "obs"
+        if isinstance(leaf, ObjectObservation):
+            groups.append(name)
+        else:
+            other.append(f"{name} {tuple(np.shape(leaf))}")
+    return groups, other
+
+
+def _print_source():
+    src = os.path.dirname(os.path.abspath(jaxatari.__file__))
+    print(f"jaxatari: {src}")
+    if "site-packages" in src:
+        return
+    try:
+        branch = subprocess.run(["git", "-C", src, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=5)
+        rev = subprocess.run(["git", "-C", src, "log", "-1", "--format=%h %cd", "--date=short"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if branch.returncode == 0 and rev.returncode == 0:
+        print(f"jaxatari git: {branch.stdout.strip()} @ {rev.stdout.strip()}")
 
 
 @jax.jit
@@ -250,24 +288,52 @@ class _Recorder:
             print(f"saved {self.frames} frames -> {self.path}")
 
 
-def main(args):
-    for sig in SIGNALS:
-        if sig != signal.SIGINT:
-            signal.signal(sig, _raise_interrupt)
+def _raw_session(base, args, other_fields):
+    """Fallback for games without ObjectObservation groups: plain game, no OCCAMWrapper."""
+    atari = _make_atari(base)
+    reset_fn = jax.jit(atari.reset)
+    step_fn = jax.jit(atari.step)
+    render = jax.jit(base.render)
 
-    base = jaxatari.make(args.game, mods=args.mods or None)
+    lines = [
+        "no ObjectObservation groups",
+        "-> OCCAM cannot build a mask",
+        "",
+        "_get_observation fields:",
+    ] + [f"  {f}" for f in (other_fields or ["(none)"])]
+    info_w = 300
+    info = np.concatenate([_strip(info_w, HEAD_H, line) for line in lines], axis=0)
+
+    def reset(key):
+        _, st = reset_fn(key)
+        return None, st
+
+    def step(obs, st, action):
+        reward, done = 0.0, False
+        for _ in range(args.frame_skip):
+            _, st, r, term, trunc, _ = step_fn(st, jnp.int32(action))
+            reward += float(r)
+            if bool(term) or bool(trunc):
+                done = True
+                break
+        return None, st, reward, done
+
+    def compose(obs, st):
+        clean = _rgb_tile(np.asarray(render(st.env_state), np.uint8), ALL_SCALE)
+        return _even(_panel_row([("clean (raw, no OCCAM)", clean), ("observation", info)]))
+
+    return SimpleNamespace(label="raw", reset=reset, step=step, compose=compose,
+                           toggle_colors=None, status=lambda: "")
+
+
+def _occam_session(base, args):
     modes = list(MASK_MODES) if args.mode == "all" else [args.mode]
     envs = {m: _make_env(base, m, args) for m in modes}
     primary = envs[modes[0]]
     viz = _OCCAMViz(primary.base_env, modes[0])
     render = jax.jit(primary.base_env.render)
     palette = np.asarray(_make_color_palette(viz.num_classes))
-    action_set = np.asarray(getattr(primary.base_env, "ACTION_SET", np.arange(primary.base_env.action_space().n)))
-    action_parts = [_action_parts(int(a)) for a in action_set]
-
-    print(f"jaxatari: {os.path.dirname(jaxatari.__file__)}")
-    print(f"groups ({viz.num_classes}): {', '.join(viz.group_names)}")
-    print(f"actions: {['+'.join(sorted(p)) or 'NOOP' for p in action_parts]}")
+    view = {"colored": True, "desync_reported": False, "steps": 0}
 
     def legend(width, env_state):
         counts = np.asarray(viz._counts(env_state))
@@ -287,6 +353,12 @@ def main(args):
         header = np.concatenate([_strip(w, HEAD_H, name) for name, w in panels], axis=1)
         header = np.pad(header, ((0, 0), (0, max(0, body.shape[1] - header.shape[1])), (0, 0)))[:, :body.shape[1]]
         return _even(np.concatenate([legend(body.shape[1], env_state), header, body], axis=0))
+
+    if args.mode == "all":
+        res_viz = _OCCAMViz(primary.base_env, "class", obs_res=True)
+        class_colors = jax.jit(lambda s: res_viz._mask_rgb(render(s), primary.base_env._get_observation(s)))
+        downscaled = jax.jit(lambda s: res_viz._to_obs_res(render(s)))
+        observe = jax.jit(primary.base_env._get_observation)
 
     def compose_all(obs, state):
         env_state = state[modes[0]].atari_state.env_state
@@ -321,23 +393,73 @@ def main(args):
         ]
         return _even(np.concatenate(rows, axis=0))
 
-    view = {"colored": True}
-    if args.mode == "all":
-        res_viz = _OCCAMViz(primary.base_env, "class", obs_res=True)
-        class_colors = jax.jit(lambda s: res_viz._mask_rgb(render(s), primary.base_env._get_observation(s)))
-        downscaled = jax.jit(lambda s: res_viz._to_obs_res(render(s)))
-        observe = jax.jit(primary.base_env._get_observation)
-
-    compose = compose_all if args.mode == "all" else compose_single
-
-    def reset(sub):
-        results = {m: envs[m].reset(sub) for m in modes}
+    def reset(key):
+        results = {m: envs[m].reset(key) for m in modes}
+        view["steps"] = 0
         return {m: r[0] for m, r in results.items()}, {m: r[1] for m, r in results.items()}
+
+    def step(obs, state, action):
+        results = {m: envs[m].step(state[m], jnp.int32(action)) for m in modes}
+        obs = {m: r[0] for m, r in results.items()}
+        state = {m: r[1] for m, r in results.items()}
+        _, _, reward, terminated, truncated, _ = results[modes[0]]
+        view["steps"] += 1
+        if not view["desync_reported"]:
+            ref = state[modes[0]].atari_state.env_state
+            for m in modes[1:]:
+                if not bool(_same_state(state[m].atari_state.env_state, ref)):
+                    print(f"[warn] game state of '{m}' diverged from '{modes[0]}' at step {view['steps']}")
+                    view["desync_reported"] = True
+        done = bool(terminated) or bool(truncated)
+        if done:
+            view["steps"] = 0
+        return obs, state, float(reward), done
+
+    def toggle_colors():
+        view["colored"] = not view["colored"]
+
+    def status():
+        if args.mode != "all":
+            return ""
+        return " | colors: occam" if view["colored"] else " | colors: agent gray"
+
+    return SimpleNamespace(
+        label=args.mode,
+        reset=reset,
+        step=step,
+        compose=compose_all if args.mode == "all" else compose_single,
+        toggle_colors=toggle_colors if args.mode == "all" else None,
+        status=status,
+    )
+
+
+def main(args):
+    for sig in SIGNALS:
+        if sig != signal.SIGINT:
+            signal.signal(sig, _raise_interrupt)
+
+    _print_source()
+    base = jaxatari.make(args.game, mods=args.mods or None)
+    group_names, other_fields = _describe_obs(base._get_observation(base.reset(jax.random.PRNGKey(0))[1]))
+    print(f"groups ({len(group_names)}): {', '.join(group_names) or '-'}")
+    if other_fields:
+        print(f"not masked (no ObjectObservation): {', '.join(other_fields)}")
+
+    if group_names:
+        session = _occam_session(base, args)
+    else:
+        print(f"[warn] '{args.game}' exposes no ObjectObservation groups -> OCCAM masks impossible, "
+              f"showing the raw game only (--mode ignored)")
+        session = _raw_session(base, args, other_fields)
+
+    action_set = np.asarray(getattr(base, "ACTION_SET", np.arange(base.action_space().n)))
+    action_parts = [_action_parts(int(a)) for a in action_set]
+    print(f"actions: {['+'.join(sorted(p)) or 'NOOP' for p in action_parts]}")
 
     key = jax.random.PRNGKey(args.seed)
     key, sub = jax.random.split(key)
-    obs, state = reset(sub)
-    frame = compose(obs, state)
+    obs, state = session.reset(sub)
+    frame = session.compose(obs, state)
 
     pygame.init()
     font = pygame.font.SysFont(None, 22)
@@ -349,7 +471,7 @@ def main(args):
         scale = max(1, min(scale, fit_w, fit_h))
     win_w, win_h = frame.shape[1] * scale, frame.shape[0] * scale + BAR_H
     screen = pygame.display.set_mode((win_w, win_h))
-    pygame.display.set_caption(f"OCCAM play: {args.game} ({args.mode})")
+    pygame.display.set_caption(f"OCCAM play: {args.game} ({session.label})")
     button = pygame.Rect(win_w - 130, 4, 122, BAR_H - 8)
     clock = pygame.time.Clock()
 
@@ -360,7 +482,6 @@ def main(args):
     episode = 0
     ep_return = 0.0
     running = True
-    desync_reported = False
 
     try:
         while running:
@@ -377,13 +498,13 @@ def main(args):
                         step_once = True
                     elif event.key == pygame.K_v:
                         toggle_rec = True
-                    elif event.key == pygame.K_c and args.mode == "all":
-                        view["colored"] = not view["colored"]
-                        frame = compose(obs, state)
+                    elif event.key == pygame.K_c and session.toggle_colors:
+                        session.toggle_colors()
+                        frame = session.compose(obs, state)
                     elif event.key == pygame.K_r:
                         key, sub = jax.random.split(key)
-                        obs, state = reset(sub)
-                        frame = compose(obs, state)
+                        obs, state = session.reset(sub)
+                        frame = session.compose(obs, state)
                         steps, ep_return = 0, 0.0
                         episode += 1
                         if recorder.active:
@@ -396,27 +517,19 @@ def main(args):
                     recorder.stop()
                 else:
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    recorder.start(os.path.join(args.out_dir, f"{args.game}_{args.mode}_{stamp}.mp4"), frame)
+                    recorder.start(os.path.join(args.out_dir, f"{args.game}_{session.label}_{stamp}.mp4"), frame)
 
             if running and (not paused or step_once):
                 step_once = False
                 action = _choose_action(action_parts, _pressed_parts())
-                results = {m: envs[m].step(state[m], jnp.int32(action)) for m in modes}
-                obs = {m: r[0] for m, r in results.items()}
-                state = {m: r[1] for m, r in results.items()}
-                _, _, reward, terminated, truncated, _ = results[modes[0]]
-                if not desync_reported:
-                    for m in modes[1:]:
-                        if not bool(_same_state(state[m].atari_state.env_state, state[modes[0]].atari_state.env_state)):
-                            print(f"[warn] game state of '{m}' diverged from '{modes[0]}' at step {steps + 1}")
-                            desync_reported = True
+                obs, state, reward, done = session.step(obs, state, action)
                 steps += 1
-                ep_return += float(reward)
-                if bool(terminated) or bool(truncated):
+                ep_return += reward
+                if done:
                     print(f"episode {episode} done: return {ep_return:.0f}, {steps} steps")
                     episode += 1
                     steps, ep_return = 0, 0.0
-                frame = compose(obs, state)
+                frame = session.compose(obs, state)
                 if recorder.active:
                     recorder.add(frame)
 
@@ -424,14 +537,13 @@ def main(args):
             surf = pygame.surfarray.make_surface(frame.transpose(1, 0, 2))
             surf = pygame.transform.scale(surf, (frame.shape[1] * scale, frame.shape[0] * scale))
             screen.blit(surf, (0, BAR_H))
-            status = f"{args.game} | {args.mode} | episode {episode} | step {steps} | return {ep_return:.0f}"
-            if args.mode == "all":
-                status += " | colors: occam" if view["colored"] else " | colors: agent gray"
+            status = f"{args.game} | {session.label} | episode {episode} | step {steps} | return {ep_return:.0f}"
+            status += session.status()
             if paused:
                 status += " | PAUSED"
             screen.blit(font.render(status, True, (230, 230, 230)), (8, 4))
             help_text = "arrows/WASD + space   P pause   N step   R reset   V rec   Esc quit"
-            if args.mode == "all":
+            if session.toggle_colors:
                 help_text += "   C colors"
             screen.blit(font.render(help_text, True, (150, 150, 150)), (8, 22))
             pygame.draw.rect(screen, (200, 40, 40) if recorder.active else (70, 70, 70), button, border_radius=6)
